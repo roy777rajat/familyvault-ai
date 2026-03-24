@@ -1,23 +1,32 @@
 """
-FamilyVault AI — Chat Handler v12
-Architecture: Planner → Orchestrator → Tools → Streamer
+FamilyVault AI — Chat Handler v13
+Architecture: Memory Loader → Planner → Orchestrator → Tools → Streamer
 
-Flow:
-  1. PLANNER   : Claude Haiku reads user query, produces JSON execution plan
-  2. ORCHESTRATOR: Executes plan steps in order, accumulates context
-  3. TOOLS     : document_list | search_documents | download_document | answer_question | out_of_scope
-  4. STREAMER  : pushes tokens / html / links / scratchpad back over WebSocket
+What changed from v12:
+  - SHORT-TERM MEMORY: Last 6 turns of the CURRENT session are loaded from DynamoDB
+    and passed as real conversation history to the Planner AND Answerer.
+    Effect: "what was that number again?", "tell me more", "can I get the link for it?" all work.
 
-Version History:
-  v1-v7:  Various iterations of intent detection (regex-based, unreliable)
-  v8:     First Planner+Orchestrator architecture
-  v9:     Push logging, relative score threshold (failed - scores cluster at 0.61)
-  v10:    WebSocket push fix, clear_streaming message type
-  v11:    Keyword-grounded download (not score-based)
-  v12:    Smart document_list filter, score display, agent scratchpad streaming
+  - LONG-TERM MEMORY: Last 3 OTHER sessions are summarised into a compact user context
+    block and injected into the Answerer system prompt.
+    Effect: "as we discussed before...", references across sessions, personalised responses.
+
+  - PLANNER is now memory-aware: it receives the conversation history so it can
+    correctly interpret follow-up questions like "download that one" without needing
+    the user to restate the document name.
+
+  - save_turn() now stores sources alongside the answer for richer long-term summaries.
+
+  - Memory is loaded ONCE at the start of orchestrate() and reused — zero extra
+    round-trips for the common case where both memory functions are called.
+
+Memory layers:
+  SHORT-TERM  ChatSessions (same session_id) → last 6 Q+A pairs → Anthropic messages format
+  LONG-TERM   ChatSessions (other sessions)  → last 3 sessions   → compact text summary block
 """
 import json, boto3, os, uuid, re
 from datetime import datetime, timezone
+from boto3.dynamodb.conditions import Attr
 
 dynamodb = boto3.resource("dynamodb", region_name="eu-west-1")
 bedrock  = boto3.client("bedrock-runtime", region_name="eu-west-1")
@@ -38,54 +47,125 @@ WELCOME = (
     "or \"How many documents do I have?\"."
 )
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n#  PLANNER SYSTEM PROMPT
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-PLANNER_SYSTEM = """You are the Planner for FamilyVault AI, a personal document assistant.
+# ==============================================================
+#  MEMORY LAYER
+# ==============================================================
 
-Your job is to read the user's question and produce a JSON execution plan.
-
-Available tools:
-1. document_list    \u2014 Fetch user document list from DynamoDB.
-                      Supports optional "filter" for targeted queries:
-                        {"tool":"document_list","filter":"pan card","reason":"..."}
-                        {"tool":"document_list","filter":"insurance","reason":"..."}
-                      Omit "filter" to show ALL documents.
-2. search_documents \u2014 Semantic search over document contents via Bedrock KB
-3. download_document\u2014 Generate presigned download links for KB-matched documents
-4. answer_question  \u2014 Generate a natural language answer using retrieved context
-5. out_of_scope     \u2014 User asked something unrelated to documents
-
-RULES:
-- Return ONLY a valid JSON array. No markdown, no explanation.
-- Each step: {"tool": "<name>", "query": "<search string>", "reason": "<why>"}
-- Use "query" only for search_documents steps.
-- Use "filter" only for document_list steps (keyword to filter by).
-- Include download_document ONLY if user EXPLICITLY asked for a link/download/url.
-- Include answer_question if there is a content question to answer.
-- Maximum 4 steps.
-
-Examples:
-User: "What is my PAN card number?"
-Plan: [{"tool":"search_documents","query":"PAN card number","reason":"Find PAN card"},{"tool":"answer_question","reason":"Answer question"}]
-
-User: "List all my documents"
-Plan: [{"tool":"document_list","reason":"Show full document inventory"}]
-
-User: "Do I have any insurance documents?"
-Plan: [{"tool":"document_list","filter":"insurance","reason":"Filter to insurance docs"}]
-
-User: "Share PAN card details and download link"
-Plan: [{"tool":"search_documents","query":"PAN card","reason":"Find PAN card"},{"tool":"answer_question","reason":"Share details"},{"tool":"download_document","reason":"User asked for link"}]
-
-User: "What is the weather today?"
-Plan: [{"tool":"out_of_scope"}]"""
+def load_short_term_memory(uid, sid, limit=6):
+    """
+    Load the last `limit` turns from the CURRENT session.
+    Returns a list of Anthropic-format messages:
+      [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+    These are injected directly into the messages array for both Planner and Answerer.
+    """
+    try:
+        table = dynamodb.Table("ChatSessions")
+        result = table.scan(
+            FilterExpression=Attr("PK").eq("USER#" + uid)
+                           & Attr("session_id").eq(sid)
+                           & Attr("deleted").ne(True)
+        )
+        items = result.get("Items", [])
+        # Sort by created_at ascending, take the last `limit`
+        items.sort(key=lambda x: x.get("created_at", ""))
+        items = items[-limit:]
+        messages = []
+        for item in items:
+            q = (item.get("question") or "").strip()
+            a = (item.get("answer") or "").strip()
+            if q:
+                messages.append({"role": "user",      "content": q})
+            if a and not a.startswith("[Document list"):
+                messages.append({"role": "assistant", "content": a})
+        print(f"Short-term memory: {len(items)} turns loaded for session {sid}")
+        return messages
+    except Exception as e:
+        print(f"Short-term memory load error: {e}")
+        return []
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+def load_long_term_memory(uid, current_sid, max_sessions=3):
+    """
+    Load the last `max_sessions` sessions OTHER than the current one.
+    Returns a compact plain-text block summarising past conversations.
+    This is injected as a PREFIX into the Answerer system prompt only
+    (not into the Planner, to keep plans concise and unbiased).
+
+    Format:
+      === Past conversations (long-term memory) ===
+      [Session 1 - 12 Mar 2026]
+      Q: What is my PAN card number?
+      A: Your PAN number is ABCDE1234F from PanCard.pdf.
+      ...
+    """
+    try:
+        table = dynamodb.Table("ChatSessions")
+        result = table.scan(
+            FilterExpression=Attr("PK").eq("USER#" + uid)
+                           & Attr("deleted").ne(True)
+        )
+        items = result.get("Items", [])
+
+        # Group by session, exclude current session
+        sessions = {}
+        for item in items:
+            s = item.get("session_id", "")
+            if not s or s == current_sid:
+                continue
+            if s not in sessions:
+                sessions[s] = []
+            sessions[s].append(item)
+
+        if not sessions:
+            return ""
+
+        # Sort sessions by most recent turn, take last max_sessions
+        def session_ts(items_list):
+            return max((i.get("created_at", "") for i in items_list), default="")
+
+        sorted_sessions = sorted(sessions.items(), key=lambda kv: session_ts(kv[1]), reverse=True)
+        sorted_sessions = sorted_sessions[:max_sessions]
+
+        lines = ["=== Past conversations (long-term memory) ==="]
+        for sess_id, sess_items in sorted_sessions:
+            sess_items.sort(key=lambda x: x.get("created_at", ""))
+            # Date label from first turn
+            first_ts = sess_items[0].get("created_at", "")
+            date_label = ""
+            try:
+                date_label = datetime.fromisoformat(first_ts.replace("Z", "+00:00")).strftime("%d %b %Y")
+            except:
+                date_label = first_ts[:10]
+
+            lines.append(f"\n[Session - {date_label}]")
+            for item in sess_items[-4:]:  # max 4 turns per session to keep it compact
+                q = (item.get("question") or "").strip()
+                a = (item.get("answer") or "").strip()
+                sources = item.get("sources", [])
+                if q and a and not a.startswith("[Document list"):
+                    lines.append(f"Q: {q}")
+                    # Truncate long answers
+                    a_short = a[:300] + "..." if len(a) > 300 else a
+                    lines.append(f"A: {a_short}")
+                    if sources:
+                        lines.append(f"   (Sources: {', '.join(sources[:3])})")
+
+        if len(lines) <= 1:
+            return ""
+
+        memory_text = "\n".join(lines)
+        print(f"Long-term memory: {len(sorted_sessions)} past sessions loaded")
+        return memory_text
+    except Exception as e:
+        print(f"Long-term memory load error: {e}")
+        return ""
+
+
+# ==============================================================
 #  HELPERS
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
+
 def get_user_docs(uid):
-    from boto3.dynamodb.conditions import Attr
     table = dynamodb.Table("DocumentMetadata")
     result = table.scan(FilterExpression=Attr("user_id").eq(uid) & Attr("deleted").ne(True))
     docs = result.get("Items", [])
@@ -141,7 +221,8 @@ def make_presigned(s3_key, filename, expiry=86400):
 
 
 def build_doc_table(docs, filter_label=None):
-    title = f"Documents matching '{filter_label}' ({len(docs)} found)" if filter_label else f"Your Documents ({len(docs)} total)"
+    title = (f"Documents matching '{filter_label}' ({len(docs)} found)"
+             if filter_label else f"Your Documents ({len(docs)} total)")
     rows = ""
     for i, d in enumerate(sort_docs(docs), 1):
         fname = d.get("filename", "\u2014")
@@ -151,36 +232,110 @@ def build_doc_table(docs, filter_label=None):
         st    = d.get("status", "\u2014")
         sc    = "st-ok" if st == "INDEXED" else "st-proc" if "PROCESS" in st else "st-pend"
         sl    = "Indexed" if st == "INDEXED" else "Processing" if "PROCESS" in st else st
-        rows += f"<tr><td class='tsl'>{i}</td><td class='tfn'>{fname}</td><td class='tca'>{cat}</td><td class='tsr'>{src}</td><td class='tdt'>{date}</td><td><span class='tbl-st {sc}'>{sl}</span></td></tr>"
-    return f'<div class="doc-table-wrap"><div class="doc-table-hd">{title}</div><div class="doc-table-scroll"><table class="doc-table"><thead><tr><th>Sl</th><th>Document Name</th><th>Category</th><th>Source</th><th>Date</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div></div>'
+        rows += (f"<tr><td class='tsl'>{i}</td><td class='tfn'>{fname}</td>"
+                 f"<td class='tca'>{cat}</td><td class='tsr'>{src}</td>"
+                 f"<td class='tdt'>{date}</td><td><span class='tbl-st {sc}'>{sl}</span></td></tr>")
+    return (f'<div class="doc-table-wrap"><div class="doc-table-hd">{title}</div>'
+            f'<div class="doc-table-scroll"><table class="doc-table">'
+            f'<thead><tr><th>Sl</th><th>Document Name</th><th>Category</th>'
+            f'<th>Source</th><th>Date</th><th>Status</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table></div></div>')
 
 
-def save_turn(uid, sid, question, answer):
+def save_turn(uid, sid, question, answer, sources=None):
+    """Enhanced save_turn that stores sources for richer long-term summaries."""
     try:
         dynamodb.Table("ChatSessions").put_item(Item={
-            "PK": "USER#" + uid, "SK": "SESSION#" + sid + "#TURN#" + str(uuid.uuid4()),
-            "session_id": sid, "question": question, "answer": answer[:600],
-            "sources": [], "created_at": datetime.now(timezone.utc).isoformat(), "deleted": False
+            "PK": "USER#" + uid,
+            "SK": "SESSION#" + sid + "#TURN#" + str(uuid.uuid4()),
+            "session_id": sid,
+            "question": question,
+            "answer": answer[:800],       # increased from 600 to 800
+            "sources": sources or [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "deleted": False
         })
     except Exception as e:
         print(f"DDB save: {e}")
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-#  PLANNER
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-def plan(query):
+# ==============================================================
+#  PLANNER  (memory-aware)
+# ==============================================================
+
+PLANNER_SYSTEM = """You are the Planner for FamilyVault AI, a personal document assistant.
+
+Your job: read the user's LATEST question (and any prior conversation history provided)
+and produce a JSON execution plan.
+
+IMPORTANT — FOLLOW-UP AWARENESS:
+If the user says "tell me more", "what about that", "download it", "the same document",
+"what was the number", "give me the link for that" etc., use the conversation history
+to understand WHAT they are referring to, and build the plan accordingly.
+Do NOT ask the user to repeat themselves.
+
+Available tools:
+1. document_list    — Fetch user document list from DynamoDB.
+                      Optional "filter" for targeted queries.
+2. search_documents — Semantic search over document contents via Bedrock KB
+3. download_document— Generate presigned download links for KB-matched documents
+4. answer_question  — Generate a natural language answer using retrieved context
+5. out_of_scope     — User asked something unrelated to documents
+
+RULES:
+- Return ONLY a valid JSON array. No markdown, no explanation.
+- Each step: {"tool": "<name>", "query": "<search string>", "reason": "<why>"}
+- Use "query" only for search_documents steps.
+- Use "filter" only for document_list steps.
+- Include download_document ONLY if user EXPLICITLY asked for a link/download/url.
+- Include answer_question if there is a content question to answer.
+- Maximum 4 steps.
+
+Examples:
+User: "What is my PAN card number?"
+Plan: [{"tool":"search_documents","query":"PAN card number","reason":"Find PAN details"},{"tool":"answer_question","reason":"Answer"}]
+
+User: "List all my documents"
+Plan: [{"tool":"document_list","reason":"Show inventory"}]
+
+User: "Do I have any insurance documents?"
+Plan: [{"tool":"document_list","filter":"insurance","reason":"Filter insurance"}]
+
+User: "Share PAN card details and download link"
+Plan: [{"tool":"search_documents","query":"PAN card","reason":"Find PAN"},{"tool":"answer_question","reason":"Share details"},{"tool":"download_document","reason":"User asked for link"}]
+
+User: "Give me the download link for that" (with prior context about PAN card)
+Plan: [{"tool":"search_documents","query":"PAN card","reason":"Re-find to ground download"},{"tool":"download_document","reason":"User wants the link from prior context"}]
+
+User: "What is the weather today?"
+Plan: [{"tool":"out_of_scope"}]"""
+
+
+def plan(query, short_term_history):
+    """
+    Call Claude Haiku to produce a JSON execution plan.
+    short_term_history: list of {"role": ..., "content": ...} for the current session.
+    The user's current query is appended as the final user message.
+    """
     try:
+        # Build messages: prior turns + current query
+        messages = list(short_term_history)  # copy
+        messages.append({"role": "user", "content": query})
+
         resp = bedrock.invoke_model(
             modelId=PLANNER_MODEL,
-            body=json.dumps({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 512,
-                             "system": PLANNER_SYSTEM, "messages": [{"role": "user", "content": query}]})
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 512,
+                "system": PLANNER_SYSTEM,
+                "messages": messages
+            })
         )
         raw = json.loads(resp["body"].read())["content"][0]["text"].strip()
         raw = re.sub(r'^```[a-z]*\n?', '', raw, flags=re.M)
         raw = re.sub(r'\n?```$', '', raw, flags=re.M)
         steps = json.loads(raw)
-        print(f"Plan: {steps}")
+        print(f"Plan (with {len(short_term_history)} history msgs): {steps}")
         return steps
     except Exception as e:
         print(f"Planner error: {e}")
@@ -188,10 +343,10 @@ def plan(query):
                 {"tool": "answer_question", "reason": "fallback"}]
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
 #  TOOL: search_documents
-#  KB retrieve \u2192 score filter \u2192 dedup \u2192 rerank
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
+
 def tool_search_documents(query, min_score=0.50):
     kb_client = boto3.client("bedrock-agent-runtime", region_name="eu-west-1")
     try:
@@ -210,65 +365,81 @@ def tool_search_documents(query, min_score=0.50):
 
     for r in raw_results:
         score = r.get("score", 0)
-        if score < min_score: continue
+        if score < min_score:
+            continue
         text = r.get("content", {}).get("text", "") or r.get("metadata", {}).get("text", "")
-        if not text or not text.strip(): continue
+        if not text or not text.strip():
+            continue
         sig = text.strip()[:120]
-        if sig in seen: continue
+        if sig in seen:
+            continue
         seen.add(sig)
         fname = r.get("metadata", {}).get("filename", "")
         if not fname:
             uri = r.get("location", {}).get("s3Location", {}).get("uri", "")
-            if uri: fname = uri.split("/")[-1]
+            if uri:
+                fname = uri.split("/")[-1]
         chunks.append({"text": text.strip(), "score": round(score, 4), "filename": fname})
-        if fname and fname not in sources: sources.append(fname)
+        if fname and fname not in sources:
+            sources.append(fname)
 
     chunks.sort(key=lambda x: -x["score"])
     print(f"KB filtered: {len(chunks)} chunks, sources={sources}")
     return chunks, sources
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-#  TOOL: document_list (with optional keyword filter)
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
+#  TOOL: document_list
+# ==============================================================
+
 def tool_document_list(uid, filter_query=None):
     all_docs = get_user_docs(uid)
     if not filter_query or not filter_query.strip():
         return all_docs, False
     fq = filter_query.lower().strip()
-    stops = {"the","a","an","of","in","for","and","or","my","all","show","list","have","do","i","any","some","about"}
+    stops = {"the","a","an","of","in","for","and","or","my","all","show",
+             "list","have","do","i","any","some","about"}
     keywords = [w for w in re.split(r'\W+', fq) if len(w) > 1 and w not in stops]
-    if not keywords: return all_docs, False
+    if not keywords:
+        return all_docs, False
     matched = [d for d in all_docs if any(
-        kw in f"{(d.get('filename','') or '').lower()} {doc_category(d.get('filename','')).lower()} {(d.get('subject','') or '').lower()} {(d.get('sender_email','') or '').lower()}"
+        kw in (
+            f"{(d.get('filename','') or '').lower()} "
+            f"{doc_category(d.get('filename','')).lower()} "
+            f"{(d.get('subject','') or '').lower()} "
+            f"{(d.get('sender_email','') or '').lower()}"
+        )
         for kw in keywords
     )]
     return matched, True
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
 #  TOOL: download_document
-#  Keyword-grounded: only links docs matching Planner's search query keywords
-#  NOTE: KB scores cluster at 0.61+/-0.02 making score-based filtering impossible
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
+
 def tool_download_document(all_docs, grounded_sources, search_queries=None):
-    if not grounded_sources: return []
+    if not grounded_sources:
+        return []
     query_keywords = set()
     if search_queries:
         stops = {"the","for","and","of","a","an","in","on","at","to","with","details","number",
                  "what","is","my","their","from","about","show","find","get","tell","please","can","you"}
         for q in search_queries:
             for w in re.split(r'\W+', q.lower()):
-                if len(w) > 2 and w not in stops: query_keywords.add(w)
+                if len(w) > 2 and w not in stops:
+                    query_keywords.add(w)
     print(f"Download keywords: {query_keywords}")
     scored_sources = []
     for src in grounded_sources:
         src_lower = src.lower()
         if query_keywords:
             kw_matches = sum(1 for kw in query_keywords if kw in src_lower)
-            if kw_matches > 0: scored_sources.append((kw_matches, src))
+            if kw_matches > 0:
+                scored_sources.append((kw_matches, src))
         else:
-            scored_sources.append((0, src)); break
+            scored_sources.append((0, src))
+            break
     if not scored_sources and grounded_sources:
         scored_sources = [(0, grounded_sources[0])]
     scored_sources.sort(key=lambda x: -x[0])
@@ -279,7 +450,8 @@ def tool_download_document(all_docs, grounded_sources, search_queries=None):
         fname = (doc.get("filename") or "").lower().strip()
         for src in target_sources:
             if fname == src.lower() or fname in src.lower() or src.lower() in fname:
-                if doc not in matched: matched.append(doc)
+                if doc not in matched:
+                    matched.append(doc)
                 break
     links = []
     for doc in matched[:5]:
@@ -287,16 +459,24 @@ def tool_download_document(all_docs, grounded_sources, search_queries=None):
         fname  = doc.get("filename", "document")
         if s3_key:
             url = make_presigned(s3_key, fname)
-            if url: links.append({"filename": fname, "url": url})
+            if url:
+                links.append({"filename": fname, "url": url})
     print(f"Download: {len(links)} links for sources={target_sources}")
     return links
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-#  TOOL: answer_question
-#  Claude streams answer using accumulated chunk context
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-def tool_answer_question(query, all_chunks, push_fn):
+# ==============================================================
+#  TOOL: answer_question  (memory-aware)
+# ==============================================================
+
+def tool_answer_question(query, all_chunks, push_fn, short_term_history, long_term_summary):
+    """
+    Streams an answer from Claude Haiku.
+    Now receives:
+      short_term_history  : list of prior messages in this session (Anthropic format)
+      long_term_summary   : plain-text block of past sessions (injected into system prompt)
+    """
+    # Build RAG context
     if not all_chunks:
         rag_context = "No relevant document content was found for this query."
     else:
@@ -304,30 +484,54 @@ def tool_answer_question(query, all_chunks, push_fn):
         for ch in all_chunks[:6]:
             fname = ch.get("filename", "")
             score = ch.get("score", 0)
-            src = f"[Source: {fname} | Score: {score:.3f}]" if fname else ""
+            src   = f"[Source: {fname} | Score: {score:.3f}]" if fname else ""
             ctx_parts.append(f"{src}\n{ch['text']}")
         rag_context = "\n\n---\n\n".join(ctx_parts)
-    system = f"""You are FamilyVault AI \u2014 a warm, professional personal document assistant.
-Answer the user's question using ONLY the retrieved document content below.
 
+    # Build system prompt: long-term memory prefix + answering rules
+    long_term_block = ""
+    if long_term_summary:
+        long_term_block = f"""
+{long_term_summary}
+
+Use the above past conversations as BACKGROUND CONTEXT only.
+Do not repeat past answers verbatim — synthesise naturally if relevant.
+If the user's current question is clearly a follow-up on a past topic, acknowledge it briefly.
+
+"""
+
+    system = f"""You are FamilyVault AI \u2014 a warm, professional personal document assistant.
+You have a memory of past conversations (provided above) and the current conversation history.
+Answer the user's LATEST question using ONLY the retrieved document content and your conversation memory.
+{long_term_block}
 RETRIEVED DOCUMENT CONTENT:
 {rag_context}
 
 STRICT RULES:
-1. Answer ONLY from retrieved content. Never invent or hallucinate.
+1. Answer ONLY from retrieved document content. Never invent or hallucinate facts not in the documents.
 2. Be specific \u2014 quote exact values (numbers, dates, grades, names) when found.
 3. Mention which document the info comes from, naturally.
-4. If content doesn't answer the question: "I wasn't able to find that specific detail. Could you give more context \u2014 for example the document type or a keyword?"
-5. NEVER use markdown bold (**) or bullet stars (*). Plain sentences only.
-6. NEVER say \"I don't have download links\" \u2014 the system handles links separately.
-7. NEVER list all documents you have access to.
-8. NEVER start with \"Based on retrieved content\" or \"According to the documents\"."""
+4. If the user says "that document", "the same one", "as before", use the conversation history to identify it.
+5. If content doesn't answer the question: say warmly that you couldn't find it and ask for more context.
+6. NEVER use markdown bold (**) or bullet stars (*). Plain sentences only.
+7. NEVER say "I don't have download links" \u2014 the system handles links separately.
+8. NEVER start with "Based on retrieved content" or "According to the documents".
+9. Keep the response concise, warm, and professional."""
+
+    # Build messages: short-term history + current query
+    messages = list(short_term_history)   # copy of prior turns
+    messages.append({"role": "user", "content": query})
+
     full = ""
     try:
         stream = bedrock.invoke_model_with_response_stream(
             modelId=ANSWERER_MODEL,
-            body=json.dumps({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 900,
-                             "system": system, "messages": [{"role": "user", "content": query}]})
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 900,
+                "system": system,
+                "messages": messages
+            })
         )
         for ev in stream["body"]:
             chunk = json.loads(ev["chunk"]["bytes"])
@@ -344,121 +548,193 @@ STRICT RULES:
     return full
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
 #  ORCHESTRATOR
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-def orchestrate(query, uid, sid, push):
-    push({"type": "status", "message": "Understanding your request..."})
-    steps = plan(query)
+# ==============================================================
 
-    # Stream plan to scratchpad
+def orchestrate(query, uid, sid, push):
+    push({"type": "status", "message": "Recalling conversation history..."})
+
+    # ── LOAD MEMORY ONCE ──────────────────────────────────────
+    short_term = load_short_term_memory(uid, sid, limit=6)
+    long_term  = load_long_term_memory(uid, sid, max_sessions=3)
+
+    st_count  = len(short_term) // 2  # approximate turn count (user+assistant pairs)
+    lt_count  = long_term.count("[Session")
+    mem_label = f"{st_count} recent turn(s) + {lt_count} past session(s)"
+    push({"type": "scratchpad", "event": "step",
+          "content": f"Memory loaded: {mem_label}"})
+
+    push({"type": "status", "message": "Understanding your request..."})
+
+    # ── PLAN (with short-term history) ────────────────────────
+    steps = plan(query, short_term)
+
     plan_lines = []
     for i, s in enumerate(steps, 1):
         q_part = f' \u2192 query: "{s["query"]}"' if s.get("query") else ""
         f_part = f' \u2192 filter: "{s["filter"]}"' if s.get("filter") else ""
-        plan_lines.append(f"  Step {i}: {s.get('tool','?')}{q_part}{f_part}  # {s.get('reason','')}")
-    push({"type": "scratchpad", "event": "plan", "content": "Plan:\n" + "\n".join(plan_lines)})
+        plan_lines.append(
+            f"  Step {i}: {s.get('tool','?')}{q_part}{f_part}  # {s.get('reason','')}"
+        )
+    push({"type": "scratchpad", "event": "plan",
+          "content": "Plan:\n" + "\n".join(plan_lines)})
 
+    # ── SHARED STATE ──────────────────────────────────────────
     all_chunks, all_sources, score_map = [], [], {}
     all_docs, full_reply, search_queries = None, "", []
-    has_list     = any(s["tool"] == "document_list"    for s in steps)
-    has_download = any(s["tool"] == "download_document" for s in steps)
+
+    has_list     = any(s["tool"] == "document_list"     for s in steps)
+    has_download = any(s["tool"] == "download_document"  for s in steps)
 
     if has_list or has_download:
         push({"type": "status", "message": "Fetching your documents..."})
         all_docs = get_user_docs(uid)
 
+    # ── EXECUTE STEPS ─────────────────────────────────────────
     for step in steps:
         tool = step.get("tool")
         print(f"Orchestrator \u2192 {tool}: {step.get('reason','')}")
         push({"type": "scratchpad", "event": "step",
-              "content": f"Executing: {tool}  ({(step.get('query') or step.get('filter') or step.get('reason',''))[:80]})"})
+              "content": f"Executing: {tool}  "
+                         f"({(step.get('query') or step.get('filter') or step.get('reason',''))[:80]})"})
 
+        # ── document_list ──────────────────────────────────
         if tool == "document_list":
             filter_q = step.get("filter", "").strip()
             list_docs, is_filtered = tool_document_list(uid, filter_q)
-            if not all_docs: all_docs = get_user_docs(uid)
+            if not all_docs:
+                all_docs = get_user_docs(uid)
             if not list_docs and is_filtered:
-                push({"type": "token", "content": f"I couldn't find any documents matching '{filter_q}' in your vault."})
+                push({"type": "token",
+                      "content": f"I couldn't find any documents matching '{filter_q}' in your vault."})
             elif not list_docs:
-                push({"type": "token", "content": "I don't see any documents in your vault yet. Upload documents using the Upload section."})
+                push({"type": "token",
+                      "content": "I don't see any documents in your vault yet. "
+                                 "Upload documents using the Upload section."})
             else:
                 push({"type": "clear_streaming"})
-                push({"type": "html", "content": build_doc_table(list_docs, filter_q if is_filtered else None)})
-                if not any(s["tool"] in ("search_documents","answer_question","download_document") for s in steps):
+                push({"type": "html",
+                      "content": build_doc_table(list_docs, filter_q if is_filtered else None)})
+                # If this is the only step, finish immediately
+                if not any(s["tool"] in ("search_documents", "answer_question", "download_document")
+                           for s in steps):
                     push({"type": "scratchpad", "event": "done", "content": ""})
                     push({"type": "final", "sources": [], "session_id": sid})
-                    save_turn(uid, sid, query, f"[Document list: {len(list_docs)} docs filter='{filter_q}']")
+                    save_turn(uid, sid, query,
+                              f"[Document list: {len(list_docs)} docs filter='{filter_q}']")
                     return
                 push({"type": "token", "content": "\n"})
 
+        # ── search_documents ───────────────────────────────
         elif tool == "search_documents":
             search_query = step.get("query", query)
             search_queries.append(search_query)
             push({"type": "status", "message": f"Searching: {search_query[:50]}..."})
             chunks, sources = tool_search_documents(search_query)
             push({"type": "scratchpad", "event": "result",
-                  "content": f"  Found {len(chunks)} chunks from: {', '.join(sources) if sources else 'no matches'}"})
+                  "content": f"  Found {len(chunks)} chunks from: "
+                             f"{', '.join(sources) if sources else 'no matches'}"})
             existing_sigs = {ck["text"][:120] for ck in all_chunks}
             for ch in chunks:
                 if ch["text"][:120] not in existing_sigs:
-                    all_chunks.append(ch); existing_sigs.add(ch["text"][:120])
-                fn, sc = ch.get("filename",""), ch.get("score",0)
-                if fn: score_map[fn] = max(score_map.get(fn, 0), sc)
+                    all_chunks.append(ch)
+                    existing_sigs.add(ch["text"][:120])
+                fn, sc = ch.get("filename", ""), ch.get("score", 0)
+                if fn:
+                    score_map[fn] = max(score_map.get(fn, 0), sc)
             for src in sources:
-                if src not in all_sources: all_sources.append(src)
+                if src not in all_sources:
+                    all_sources.append(src)
 
+        # ── answer_question  (passes memory) ───────────────
         elif tool == "answer_question":
             push({"type": "status", "message": "Preparing answer..."})
-            full_reply += tool_answer_question(query, all_chunks, push)
+            full_reply += tool_answer_question(
+                query, all_chunks, push,
+                short_term_history=short_term,
+                long_term_summary=long_term
+            )
 
+        # ── download_document ──────────────────────────────
         elif tool == "download_document":
-            if not all_docs: all_docs = get_user_docs(uid)
+            if not all_docs:
+                all_docs = get_user_docs(uid)
             links = tool_download_document(all_docs, all_sources, search_queries)
             if not links:
-                no_match = ("\n\nRegarding download links: I wasn't able to identify the specific document. "
-                            "Could you mention the name or type? e.g. \"PAN card\" or \"Sem-1 result\".")
-                push({"type": "token", "content": no_match}); full_reply += no_match
+                no_match = (
+                    "\n\nRegarding download links: I wasn't able to identify the specific document. "
+                    "Could you mention the name or type? e.g. \"PAN card\" or \"Sem-1 result\"."
+                )
+                push({"type": "token", "content": no_match})
+                full_reply += no_match
             else:
                 count = len(links)
-                intro = (f"\n\nHere {'is' if count==1 else 'are'} the secure download "
-                         f"link{'s' if count>1 else ''} for the matched document{'s' if count>1 else ''} (valid 24h):")
-                push({"type": "token", "content": intro}); full_reply += intro
-                scored_sources = [f"{s} ({score_map.get(s,0):.2f})" if score_map.get(s) else s for s in all_sources]
+                intro = (
+                    f"\n\nHere {'is' if count == 1 else 'are'} the secure download "
+                    f"link{'s' if count > 1 else ''} for the matched "
+                    f"document{'s' if count > 1 else ''} (valid 24h):"
+                )
+                push({"type": "token", "content": intro})
+                full_reply += intro
+                scored_sources = [
+                    f"{s} ({score_map.get(s, 0):.2f})" if score_map.get(s) else s
+                    for s in all_sources
+                ]
                 push({"type": "scratchpad", "event": "done", "content": ""})
                 push({"type": "final", "sources": scored_sources, "session_id": sid})
                 push({"type": "links", "links": links})
-                save_turn(uid, sid, query, full_reply); return
+                save_turn(uid, sid, query, full_reply, sources=all_sources)
+                return
 
+        # ── out_of_scope ───────────────────────────────────
         elif tool == "out_of_scope":
-            reply = ("That is a bit outside what I can help with. "
-                     "I am best at answering questions about your stored documents, listing files, or sharing download links. "
-                     "Is there something document-related I can help with?")
+            reply = (
+                "That is a bit outside what I can help with. "
+                "I am best at answering questions about your stored documents, "
+                "listing files, or sharing download links. "
+                "Is there something document-related I can help with?"
+            )
             push({"type": "token", "content": reply})
             push({"type": "final", "sources": [], "session_id": sid})
-            save_turn(uid, sid, query, reply); return
+            save_turn(uid, sid, query, reply)
+            return
 
+    # ── FINISH ────────────────────────────────────────────────
     push({"type": "scratchpad", "event": "done", "content": ""})
-    scored_sources = [f"{s} ({score_map.get(s,0):.2f})" if score_map.get(s) else s for s in all_sources]
+    scored_sources = [
+        f"{s} ({score_map.get(s, 0):.2f})" if score_map.get(s) else s
+        for s in all_sources
+    ]
     push({"type": "final", "sources": scored_sources, "session_id": sid})
-    save_turn(uid, sid, query, full_reply or "[Document list shown]")
+    save_turn(uid, sid, query, full_reply or "[Document list shown]", sources=all_sources)
 
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
 #  LAMBDA ENTRY POINT
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ==============================================================
+
 def lambda_handler(event, context):
     route  = event.get("requestContext", {}).get("routeKey", "$default")
     cid    = event.get("requestContext", {}).get("connectionId", "")
     domain = event.get("requestContext", {}).get("domainName", "")
     stage  = event.get("requestContext", {}).get("stage", "production")
-    if route == "$connect":    return {"statusCode": 200, "body": "Connected"}
-    if route == "$disconnect": return {"statusCode": 200, "body": "Disconnected"}
+
+    if route == "$connect":
+        return {"statusCode": 200, "body": "Connected"}
+    if route == "$disconnect":
+        return {"statusCode": 200, "body": "Disconnected"}
+
     body  = json.loads(event.get("body", "{}") or "{}")
     query = body.get("query", body.get("message", "")).strip()
     sid   = body.get("session_id", str(uuid.uuid4()))
     uid   = body.get("user_id", "unknown")
-    apigw = boto3.client("apigatewaymanagementapi", endpoint_url=f"https://{domain}/{stage}")
+
+    apigw = boto3.client(
+        "apigatewaymanagementapi",
+        endpoint_url=f"https://{domain}/{stage}"
+    )
+
     def push(data):
         try:
             payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -466,13 +742,18 @@ def lambda_handler(event, context):
             apigw.post_to_connection(ConnectionId=cid, Data=payload)
         except Exception as e:
             print(f"Push FAILED type={data.get('type','?')} err={e}")
+
+    # Welcome
     if not query or query.lower() in ("hi", "hello", "hey", "start"):
-        for i in range(0, len(WELCOME), 8): push({"type": "token", "content": WELCOME[i:i+8]})
+        for i in range(0, len(WELCOME), 8):
+            push({"type": "token", "content": WELCOME[i:i + 8]})
         push({"type": "final", "sources": [], "session_id": sid})
         return {"statusCode": 200, "body": "OK"}
+
     try:
         orchestrate(query, uid, sid, push)
     except Exception as e:
         print(f"Orchestrator error: {e}")
         push({"type": "error", "message": "Something went wrong. Please try again."})
+
     return {"statusCode": 200, "body": "OK"}
