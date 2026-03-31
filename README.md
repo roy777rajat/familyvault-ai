@@ -25,66 +25,32 @@
   <img src="https://img.shields.io/badge/Runtime-Python%203.11-blue">
   <img src="https://img.shields.io/badge/UI-Vanilla%20JS%20SPA-purple">
   <img src="https://img.shields.io/badge/AI-Claude%20Haiku%204.5-orange">
+  <img src="https://img.shields.io/badge/Session-4%20of%20N-red">
 </p>
 
----
-
-## What Is FamilyVault AI?
-
-FamilyVault AI is a personal document vault that lets you store, search, and chat with your family documents using AI. Upload a PDF, ask questions in plain English, and get precise answers grounded in your actual documents — with secure download links on demand.
-
-**Live URL:** `https://d38ys5d9amc45p.cloudfront.net/app/index.html`
+> **FOR NEXT SESSION — READ THIS FIRST**
+> This README is the single source of truth. Read the ✅ Completed and 🔧 Pending sections
+> before doing anything. The most critical pending item is deploying `fv-download-handler`
+> Lambda + creating `DownloadTokens` DDB table + wiring the `/download` API Gateway route.
+> All code is in this repo. All AWS resource IDs are in the table below.
 
 ---
 
-## Architecture Overview
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                        Browser / Mobile                             │
-│              CloudFront → S3 (family-docs-ui/app/)                  │
-│              Vanilla JS SPA — single index.html                     │
-└─────────────────┬───────────────────────┬───────────────────────── ┘
-                  │ HTTPS (REST)          │ WSS (WebSocket)
-                  ▼                       ▼
-┌─────────────────────────┐  ┌──────────────────────────────────────┐
-│  API Gateway HTTP API   │  │  API Gateway WebSocket API            │
-│  fv-api (1oj10740w0)    │  │  (4hnchd4nrk / stage: production)     │
-│  JWT Authorizer         │  │  $connect / $disconnect / $default    │
-└──────────┬──────────────┘  └─────────────────────┬────────────────┘
-           │                                        │
-    ┌──────▼────────────────────────────────────────▼──────────┐
-    │                  AWS Lambda (Python 3.11)                 │
-    │  fv-upload-handler   fv-delete-handler   fv-chat-handler  │
-    │  fv-memory-handler   fv-email-sender     fv-auth-handler  │
-    └─────────────┬──────────────────────┬─────────────────── --┘
-                  │                      │
-     ┌────────────▼──────────┐   ┌───────▼──────────────────────────┐
-     │    DynamoDB           │   │        Amazon Bedrock             │
-     │  DocumentMetadata     │   │  Claude Haiku 4.5 (Planner)       │
-     │  ChatSessions         │   │  Claude Haiku 4.5 (Answerer)      │
-     │  UserProfiles         │   │  KB: PYV06IINGT (S3 Vectors)      │
-     │  EmailSentLog         │   │  Titan Embed Text v2              │
-     └───────────────────────┘   └──────────────────────────────────┘
-                                          │
-                  ┌───────────────────────▼──────────────────────────┐
-                  │           S3 Buckets                              │
-                  │  family-docs-raw    — raw uploaded docs           │
-                  │  family-docs-vectors — Bedrock vector store       │
-                  │  family-docs-ui     — SPA hosting                 │
-                  └──────────────────────────────────────────────────┘
-```
+## Live URL
+`https://d38ys5d9amc45p.cloudfront.net/app/index.html`
 
 ---
 
-## AWS Infrastructure — Resource Reference
+## AWS Infrastructure — All Resource IDs
 
 | Resource | Type | ID |
 |---|---|---|
 | Cognito User Pool | Auth | `eu-west-1_LUZKAYGwC` |
 | Cognito App Client | Auth | `5j9s5557grmvt7gbuo8nopga8o` (no secret) |
 | HTTP API | API Gateway | `1oj10740w0` |
+| HTTP API URL | — | `https://1oj10740w0.execute-api.eu-west-1.amazonaws.com` |
 | WebSocket API | API Gateway | `4hnchd4nrk` / stage: `production` |
+| WebSocket URL | — | `wss://4hnchd4nrk.execute-api.eu-west-1.amazonaws.com/production` |
 | JWT Authorizer | API Gateway | `kj2taa` |
 | Bedrock KB | Bedrock | `PYV06IINGT` |
 | Bedrock Data Source | Bedrock | `JZ13ZYCSRL` |
@@ -94,404 +60,285 @@ FamilyVault AI is a personal document vault that lets you store, search, and cha
 | Raw Documents Bucket | S3 | `family-docs-raw` |
 | Vector Store Bucket | S3 | `family-docs-vectors` |
 | UI Hosting Bucket | S3 | `family-docs-ui` |
-| Lambda Role | IAM | `FamilyVaultLambdaRole` |
-| Bedrock KB Role | IAM | `FamilyVaultBedrockKBRole` |
-| Vector Processor Role | IAM | `vector_processor_lambda-role-gc893i7i` |
+| Lambda Execution Role | IAM | `arn:aws:iam::141571819444:role/FamilyVaultLambdaRole` |
+| Root User Cognito Sub | — | `f2558464-7001-7088-8818-16f339b84fb6` |
+| Root User Email | — | `roy777rajat@gmail.com` |
+| AWS Account | — | `141571819444` |
 | AWS Region | — | `eu-west-1` (Ireland) |
 
 ---
 
 ## Lambda Functions
 
-| Function | Purpose | Trigger | Memory | Timeout |
+| Function | Version | Status | Memory | Timeout |
 |---|---|---|---|---|
-| `fv-chat-handler` | AI chat — Planner→Orchestrator→Tools | WebSocket `$default` | 1024 MB | 300s |
-| `fv-upload-handler` | Presigned URL generation, doc metadata | HTTP API | 256 MB | 30s |
-| `fv-delete-handler` | Cascade delete: S3 + DynamoDB + KB resync | HTTP API | 256 MB | 60s |
-| `fv-memory-handler` | Chat session list, delete, long-term memory | HTTP API | 256 MB | 30s |
-| `fv-email-sender` | Email draft via Claude + SES send | HTTP API | 512 MB | 60s |
-| `fv-auth-handler` | Post-confirmation, profile, security questions | HTTP API + Cognito | 256 MB | 30s |
-| `vector_processor_lambda` | S3 trigger → Textract OCR → S3 Vectors PutVectors | S3 Event | 1024 MB | 305s |
+| `fv-chat-handler` | v13 (memory-aware) | ✅ Deployed | 1024 MB | 300s |
+| `fv-upload-handler` | v2 | ✅ Deployed | 256 MB | 30s |
+| `fv-delete-handler` | v2 | ✅ Deployed | 256 MB | 60s |
+| `fv-memory-handler` | v3 | ✅ Deployed | 256 MB | 30s |
+| `fv-email-sender` | v3 (token links) | ✅ Deployed | 512 MB | 60s |
+| `fv-auth-handler` | v1 | ✅ Deployed | 256 MB | 30s |
+| `vector_processor_lambda` | v2 | ✅ Deployed | 1024 MB | 305s |
+| `fv-download-handler` | v1 | ❌ NOT DEPLOYED YET | 256 MB | 30s |
 
 ---
 
 ## DynamoDB Tables
 
-| Table | PK | SK | Purpose |
+| Table | PK | SK | Status |
 |---|---|---|---|
-| `DocumentMetadata` | `DOC#<uuid>` | — | Document records, user ownership, S3 key, status |
-| `ChatSessions` | `USER#<sub>` | `SESSION#<sid>#TURN#<uuid>` | Chat history, Q&A turns |
-| `UserProfiles` | `USER#<sub>` | — | Last login, profile, role |
-| `EmailSentLog` | `USER#<sub>` | `EMAIL#<uuid>` | SES send audit trail |
-| `SecurityQuestions` | `USER#<sub>` | — | Recovery questions |
-| `DownloadTokens` | `TOKEN#<uuid>` | — | Secure download tokens |
+| `DocumentMetadata` | `DOC#<uuid>` | — | ✅ Exists, 31 docs |
+| `ChatSessions` | `USER#<sub>` | `SESSION#<sid>#TURN#<uuid>` | ✅ Exists |
+| `UserProfiles` | `USER#<sub>` | — | ✅ Exists |
+| `EmailSentLog` | `USER#<sub>` | `EMAIL#<uuid>` | ✅ Exists |
+| `SecurityQuestions` | `USER#<sub>` | — | ✅ Exists |
+| `DownloadTokens` | `TOKEN#<uuid>` | — | ❌ NOT CREATED YET |
 
 ---
 
-## API Routes
+## 🚨 NEXT SESSION — DO THESE FIRST (Pending Deployment)
 
-### HTTP API
+These 4 steps are coded and committed to this repo. Just need to be deployed:
 
-| Method | Path | Auth | Handler |
-|---|---|---|---|
-| GET | `/documents` | JWT | fv-upload-handler |
-| POST | `/upload/presign` | JWT | fv-upload-handler |
-| POST | `/upload/complete` | JWT | fv-upload-handler |
-| GET | `/upload/status` | JWT | fv-upload-handler |
-| DELETE | `/documents/{id}` | JWT | fv-delete-handler |
-| GET | `/memory/sessions` | JWT | fv-memory-handler |
-| DELETE | `/memory/sessions/{id}` | JWT | fv-memory-handler |
-| DELETE | `/memory/all` | JWT | fv-memory-handler |
-| GET | `/memory/long-term` | JWT | fv-memory-handler |
-| POST | `/auth/post-confirm` | Public | fv-auth-handler |
-| GET | `/auth/profile` | JWT | fv-auth-handler |
-| PUT | `/auth/profile` | JWT | fv-auth-handler |
-| POST | `/email/draft` | JWT | fv-email-sender |
-| POST | `/email/send` | JWT | fv-email-sender |
-
-### WebSocket API
-
-| Route | Handler |
-|---|---|
-| `$connect` | fv-chat-handler |
-| `$disconnect` | fv-chat-handler |
-| `$default` | fv-chat-handler |
-
----
-
-## Chat Architecture — Planner → Orchestrator → Tools
-
-```
-User Query
-    ↓
-┌────────────────────────────────────────────────────┐
-│  PLANNER (Claude Haiku)                             │
-│  Reads query → produces JSON execution plan        │
-│  Output: [{tool, query, filter, reason}, ...]      │
-└──────────────────────┬─────────────────────────────┘
-                       ↓
-┌────────────────────────────────────────────────────┐
-│  ORCHESTRATOR                                       │
-│  Executes steps in order, accumulates context      │
-│                                                    │
-│  Step 1: search_documents                          │
-│    → Bedrock KB retrieve (8 results)               │
-│    → Score filter (≥ 0.50)                         │
-│    → Dedup by content hash                         │
-│    → Re-rank by score desc                         │
-│    → Merge chunks into context                     │
-│                                                    │
-│  Step 2: answer_question                           │
-│    → Build RAG context from chunks                 │
-│    → Claude streams answer tokens                  │
-│                                                    │
-│  Step 3: download_document (if requested)          │
-│    → Keyword-grounded matching                     │
-│    → Presigned S3 GET URLs (24h)                   │
-│    → Link cards pushed to UI                       │
-└────────────────────────────────────────────────────┘
-                       ↓
-┌────────────────────────────────────────────────────┐
-│  STREAMER (WebSocket)                               │
-│  token → html → links → final → scratchpad         │
-└────────────────────────────────────────────────────┘
+### Step 1 — Create DownloadTokens DynamoDB table
+```powershell
+aws dynamodb create-table `
+  --table-name DownloadTokens `
+  --attribute-definitions AttributeName=PK,AttributeType=S `
+  --key-schema AttributeName=PK,KeyType=HASH `
+  --billing-mode PAY_PER_REQUEST `
+  --region eu-west-1
 ```
 
-### 5 Intent Tools
+### Step 2 — Deploy fv-download-handler Lambda (code in `lambdas/fv-download-handler/`)
+```powershell
+# Upload zip (build from lambdas/fv-download-handler/lambda_function.py)
+aws s3 cp fv-download-handler.zip s3://family-docs-raw/lambda-packages/ --region eu-west-1
 
-| Tool | Trigger | Action |
-|---|---|---|
-| `document_list` | "list docs", "how many", filter by keyword | DynamoDB scan with optional keyword filter |
-| `search_documents` | Content questions | Bedrock KB semantic search |
-| `download_document` | "download", "link", "share" | Presigned S3 URLs for KB-matched docs only |
-| `answer_question` | Any content query | Claude Haiku streams answer |
-| `out_of_scope` | Unrelated query | Polite redirect |
+aws lambda create-function `
+  --function-name fv-download-handler `
+  --runtime python3.11 `
+  --role arn:aws:iam::141571819444:role/FamilyVaultLambdaRole `
+  --handler lambda_function.lambda_handler `
+  --code S3Bucket=family-docs-raw,S3Key=lambda-packages/fv-download-handler.zip `
+  --timeout 30 --memory-size 256 `
+  --environment "Variables={BUCKET=family-docs-raw,API_URL=https://1oj10740w0.execute-api.eu-west-1.amazonaws.com}" `
+  --region eu-west-1
 
----
-
-## UI — Single Page Application
-
-Vanilla JS SPA (zero framework) hosted on CloudFront.
-
-### Screens
-
-| Screen | Description |
-|---|---|
-| Dashboard | KPI cards, doc breakdown, recent docs, activity feed |
-| My Documents | Document grid with category filters, delete |
-| AI Chat | WebSocket chat with scratchpad, download cards, HTML tables |
-| Upload | Drag-drop upload with pipeline progress |
-| Email | AI-drafted email with SES send |
-| Memory | Chat session history grouped by session |
-| Activity | Notification feed |
-| Profile | User profile and avatar |
-| Family Vault | Family hierarchy tree with SVG (new) |
-| Settings | App configuration |
-
-### WebSocket Message Types
-
-| Type | Description |
-|---|---|
-| `token` | Streaming text token |
-| `html` | HTML table (document list) |
-| `links` | Download link cards |
-| `final` | End of response with scored sources |
-| `status` | Status indicator text |
-| `scratchpad` | Agent thinking stream |
-| `clear_streaming` | Stop typing indicator |
-| `error` | Error message |
-
----
-
-## Document Processing Pipeline
-
+aws lambda add-permission `
+  --function-name fv-download-handler `
+  --statement-id apigw-invoke `
+  --action lambda:InvokeFunction `
+  --principal apigateway.amazonaws.com `
+  --source-arn "arn:aws:execute-api:eu-west-1:141571819444:1oj10740w0/*" `
+  --region eu-west-1
 ```
-Email → SES → email_ingestor Lambda → S3 (family-docs-raw)
-    → S3 trigger → vector_processor_lambda
-    → Textract OCR → chunk (1000 chars, 200 overlap)
-    → Titan Embed Text v2 → 1024-dim embeddings
-    → S3 Vectors PutVectors (family-docs-index)
-    → DynamoDB status = INDEXED
 
-Direct Upload (browser)
-    → POST /upload/presign → Lambda → DynamoDB (PENDING) + presigned URL
-    → Browser PUT directly to S3 (no Lambda bottleneck)
-    → POST /upload/complete → DynamoDB (UPLOADED_PROCESSING)
-    → S3 trigger → same vector pipeline above
+### Step 3 — Wire /download route in API Gateway (NO auth — token is the credential)
+```powershell
+$LAMBDA_ARN = (aws lambda get-function-configuration `
+  --function-name fv-download-handler --region eu-west-1 | ConvertFrom-Json).FunctionArn
+
+$INTEGRATION_ID = (aws apigatewayv2 create-integration `
+  --api-id 1oj10740w0 `
+  --integration-type AWS_PROXY `
+  --integration-uri "arn:aws:apigateway:eu-west-1:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations" `
+  --payload-format-version 2.0 `
+  --region eu-west-1 | ConvertFrom-Json).IntegrationId
+
+aws apigatewayv2 create-route `
+  --api-id 1oj10740w0 `
+  --route-key "GET /download" `
+  --target "integrations/$INTEGRATION_ID" `
+  --region eu-west-1
+```
+
+### Step 4 — Verify fv-email-sender v3 is deployed (token-based links)
+```powershell
+aws lambda get-function-configuration `
+  --function-name fv-email-sender --region eu-west-1 `
+  --query "[CodeSize,LastModified,Environment.Variables]"
+# Should show API_URL env var. If not, redeploy fv-email-v3.zip
 ```
 
 ---
 
-## Family Hierarchy System (Designed — Sprint 2)
+## ✅ Work Completed (All Sessions)
 
-```
-FamilyVault Account
-├── 👑 Admin (Rajat Roy)       — full control, sees all nodes
-│   ├── 🧑 Parent (Anindita)  — manages children, sees child docs
-│   └── 🧒 Child (Aishiki)    — own vault only
-└── 👤 Guest                   — read-only chat access
-```
+### Session 1-2 (Mar 21)
+- [x] Full AWS infrastructure provisioned (Cognito, API GW, Lambda x7, DynamoDB x5, S3 x3, CloudFront, SES)
+- [x] Bedrock KB with S3 Vectors backend (1024-dim, cosine)
+- [x] vector_processor_lambda: Textract OCR → Titan Embed → S3 Vectors
+- [x] All 31 documents indexed (stamped with user_id, status=INDEXED)
+- [x] Cognito JWT auth end-to-end working
 
-**Rule:** Parents see downward. Children never see upward. Admin sees all.
-
-### Planned DynamoDB Table: `FamilyTree`
-
-```
-PK: FAMILY#<family_id>
-SK: MEMBER#<user_sub>
-Attributes:
-  role:       admin | parent | child | guest
-  parent_sub: <user_sub> or null (root)
-  can_see:    [<child_sub_1>, <child_sub_2>]
-  invited_by: <sub>
-  created_at: ISO datetime
-```
-
-### Role Permissions Matrix
-
-| Permission | Admin | Parent | Child | Guest |
-|---|:---:|:---:|:---:|:---:|
-| Upload Documents | ✓ | ✓ | ✓ | — |
-| Delete Documents | ✓ | ✓ | — | — |
-| Chat with AI | ✓ | ✓ | ✓ | ✓ |
-| Download Links | ✓ | ✓ | ✓ | — |
-| View Child Docs | ✓ | ✓ | — | — |
-| Invite Members | ✓ | ✓ | — | — |
-| Set Guardrails | ✓ | — | — | — |
-| Change Roles | ✓ | — | — | — |
-
----
-
-## Guardrails Framework (Sprint 3)
-
-Admin sets system-wide rules. Parents can tighten but never loosen. Children inherit.
-
-| Guardrail | Default | Scope |
-|---|---|---|
-| Max Doc Size | 10 MB | Admin sets |
-| Allowed File Types | PDF, DOCX, JPG | Admin sets |
-| Max Docs / User | 500 | Admin sets |
-| Chat History Retention | 90 days | Admin sets |
-| AI Content Filter | Standard | Admin sets |
-| Download Link Expiry | 24 hours | Admin sets |
-| Bedrock Guardrail ARN | Coming Soon | Admin sets |
-
----
-
-## Current State
-
-| Field | Value |
-|---|---|
-| Root User | Rajat Roy (`roy777rajat@gmail.com`) |
-| Cognito Sub | `f2558464-7001-7088-8818-16f339b84fb6` |
-| Documents Indexed | 31 |
-| Vector Chunks | 50+ |
-| Active Lambda Version | fv-chat-v12 |
-| Active UI Version | fv-v8 |
-| Sessions Built | 3 (Mar 21–22, 2026) |
-
----
-
-## ✅ Work Completed
-
-### Infrastructure
-- [x] Cognito User Pool + App Client (no secret, JWT)
-- [x] API Gateway HTTP API — 22 routes, JWT authorizer, CORS
-- [x] API Gateway WebSocket API — 3 routes, production stage
-- [x] 6 Lambda functions deployed (Python 3.11)
-- [x] vector_processor_lambda v2 with S3 Vectors PutVectors
-- [x] Bedrock KB (PYV06IINGT) with S3 Vectors backend, 50+ chunks
-- [x] CloudFront + OAC + custom SPA error routing
-- [x] S3 CORS on family-docs-raw for browser direct upload
-- [x] All 31 documents stamped with `user_id` and `status=INDEXED`
-- [x] Lambda invoke permissions for all API Gateway routes
-
-### Chat System
-- [x] WebSocket streaming architecture (token-by-token)
-- [x] Planner → Orchestrator → Tools (v12 — current)
-- [x] 5-intent system: document_list, search_documents, download_document, answer_question, out_of_scope
-- [x] Smart `document_list` with keyword filter passed from Planner
+### Session 3 (Mar 22)
+- [x] fv-chat-handler v12: Planner→Orchestrator→Tools→Streamer
+- [x] 5-intent tool system (document_list, search_documents, download_document, answer_question, out_of_scope)
+- [x] Smart document_list with keyword filter from Planner
 - [x] KB semantic search: score filter + dedup + reranking
-- [x] Keyword-grounded download links (not score-based — KB scores cluster at 0.61±0.02)
-- [x] Agent scratchpad streaming (collapsible "Agent Thinking" panel)
-- [x] HTML table for document list in chat (date desc, teal styled)
-- [x] Relevance scores shown in source chips `filename (0.62)`
-- [x] Presigned S3 GET URLs (24h expiry, attachment disposition)
-
-### UI
-- [x] 10-screen Vanilla JS SPA
-- [x] Mobile responsive — hamburger sidebar, persistent outside `#root`
-- [x] Dark / light theme toggle
-- [x] WebSocket connect/disconnect/status pill
-- [x] Download link cards in chat (teal, clickable)
-- [x] HTML table rendering in chat
-- [x] Agent scratchpad panel (collapsible, live streaming)
+- [x] Keyword-grounded download links
+- [x] Agent scratchpad streaming (collapsible panel)
+- [x] UI v8: 10-screen SPA, mobile responsive, dark/light theme
 - [x] Family Vault hierarchy screen with interactive SVG tree
-- [x] Drag-drop upload with 3-step pipeline progress
-- [x] Chat history (memory) screen with session grouping
+- [x] Family hierarchy business logic + role permissions designed
 
-### Documents
-- [x] 31 documents indexed across all categories
-- [x] Category auto-detection: Identity, Academic, Employment, Financial, Insurance, Other
+### Session 4 (Mar 31)
+- [x] fv-chat-handler v13: short-term + long-term memory
+  - Short-term: last 6 turns of current session → real Anthropic conversation history
+  - Long-term: last 3 past sessions → compact summary injected into Answerer system prompt
+  - Planner now memory-aware (resolves follow-ups like "download that one")
+  - save_turn() now stores sources for richer long-term context
+- [x] fv-email-sender v3: fixed 3 bugs
+  - Bug A: Wrong Bedrock model ID (missing `eu.` prefix) → fixed
+  - Bug B: Wrong JWT claims path (.claims vs .jwt.claims) → fixed
+  - Bug C: Missing OPTIONS CORS handler → fixed
+  - **NEW**: Token-based download links in email (prevents Gmail URL mangling)
+- [x] fv-download-handler: new Lambda for token→presigned redirect
+  - Email contains clean `https://api.../download?token=uuid` (Gmail-safe)
+  - Lambda resolves token from DownloadTokens DDB
+  - Generates fresh 2-minute presigned URL on every click
+  - 302 redirect → browser downloads directly from S3
+- [x] UI download link fix: iframe injection + programmatic click fallback
+- [x] Email UI improvements: validation, loading state, better draft context
+- [x] SES email verified, sending works (sandbox mode — only to verified addresses)
+- [x] GitHub repo: all code committed, README updated
 
 ---
 
-## 🔧 Pending Work
+## 🔧 Remaining Pending Work
 
-### Sprint 1.5 — Multi-User Isolation (High Priority — Before New Users)
+### Immediate (next session start)
+- [ ] **Deploy fv-download-handler** (see Steps 1-4 above)
+- [ ] **Verify email download links work** end-to-end after deployment
+- [ ] **fv-fix.html** (UI with download fix) — deploy to S3 + CloudFront invalidation
 
-- [ ] Add `user_id` metadata filter to Bedrock KB `retrieve()` calls
+### Sprint 1.5 — Multi-User KB Isolation (BEFORE adding new users)
+- [ ] Add `user_id` metadata filter to Bedrock KB `retrieve()` calls in fv-chat-handler
 - [ ] `vector_processor_lambda` — stamp `user_id` in S3 Vectors metadata on write
 - [ ] GSI on `DocumentMetadata`: `user_id-uploaded_at-index` (replace full table scan)
-- [ ] Migrate old email-ingested S3 keys from `year=2026/...` to `user=<sub>/year=...`
+- [ ] Re-backfill old email-ingested docs to include user_id in vector metadata
 
-### Sprint 2 — Family Hierarchy
-
-- [ ] Create `FamilyTree` DynamoDB table
-- [ ] Create Cognito Groups: `fv-admin`, `fv-parent`, `fv-child`
-- [ ] `fv-auth-handler` — `/auth/invite` and `/auth/accept-invite` endpoints
-- [ ] Visibility resolver: expand `user_id` to family subtree in all Lambda queries
-- [ ] KB query: filter to `user_id IN [visible_subs]`
-- [ ] UI — Family Members invite/accept flow (backend wiring of existing Family screen)
+### Sprint 2 — Family Hierarchy Backend
+- [ ] Create `FamilyTree` DynamoDB table (PK=FAMILY#id, SK=MEMBER#sub)
+- [ ] Cognito Groups: `fv-admin`, `fv-parent`, `fv-child`
+- [ ] `/auth/invite` + `/auth/accept-invite` endpoints in fv-auth-handler
+- [ ] Visibility resolver in all Lambda queries (expand user_id to subtree)
+- [ ] KB query: filter `user_id IN [visible_subs]`
+- [ ] UI: Family Members invite/accept flow (screen exists, needs backend wiring)
 
 ### Sprint 3 — Guardrails
-
-- [ ] Create `FamilyGuardrails` DynamoDB table
+- [ ] `FamilyGuardrails` DynamoDB table
 - [ ] Guardrail inheritance resolver (tighten-only logic)
-- [ ] Guardrail middleware in every Lambda (upload size check, type check, etc.)
 - [ ] Admin UI to configure guardrails
 - [ ] AWS Bedrock Guardrails native integration in fv-chat-handler
 
-### Other Fixes
-
-- [ ] Deduplicate documents (same file uploaded multiple times — 3x PolicyKit, 3x Passport)
-- [ ] `fv-auth-handler` — review and add CORS headers
-- [ ] Chat history pagination (currently `Limit=100` turns)
-- [ ] Email sender — attach actual S3 files to outgoing emails
-- [ ] Deploy `fv-chat-v12` and `fv-v8.html` (in this repo, not yet live)
+### Other
+- [ ] Deduplicate documents (3x PolicyKit, 3x Passport uploaded multiple times)
+- [ ] fv-auth-handler CORS headers review
+- [ ] Chat history pagination (currently Limit=100 turns per scan)
+- [ ] SES production access request (currently sandbox — can only send to verified addresses)
 
 ---
 
-## Known Issues & Fixes Applied
+## Known Issues & All Fixes Applied
 
-| Issue | Root Cause | Fix |
-|---|---|---|
-| Chat button always disabled | `S.chatInput` cleared before `sendChat()` reads it | Pass query as param: `sendChat(val)` |
-| User messages not appearing | `row-reverse` with wrong DOM order | Explicit: `[bubble, avatar]` for user messages |
-| Document list blank in chat | Recursive `push()` call + `streaming=true` blocking render | Clean `push()`, `clear_streaming` message, `S.streaming=false` on html |
-| All docs get download links | KB scores 0.61±0.02 — threshold useless | Keyword-grounding via Planner search query keywords |
-| Delete not working | fv-delete-handler had no Lambda invoke permission | Added `lambda:InvokeFunction` for API Gateway |
-| Sidebar hamburger not clickable | Sidebar re-rendered on repaint, losing `sb-open` class | Persistent `#app-sidebar` div outside `#root` |
-| Old docs had null user_id | Email ingestion before user system | Stamped all 31 docs via DynamoDB batch update |
-| JWT auth SECRET_HASH error | Old Cognito client had secret | New no-secret client `5j9s5557...` |
-| Wrong Bedrock model ID | Missing EU cross-region prefix | `eu.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| Browser upload blocked | No CORS on `family-docs-raw` S3 bucket | S3 CORS: `AllowedMethods=[GET,PUT,POST,DELETE,HEAD]` |
+| Issue | Root Cause | Fix Applied | Session |
+|---|---|---|---|
+| Chat button always disabled | `S.chatInput` cleared before `sendChat()` reads it | Pass query as param: `sendChat(val)` | 3 |
+| User messages not appearing | `row-reverse` with wrong DOM order | Explicit: `[bubble, avatar]` for user messages | 3 |
+| Document list blank in chat | Recursive `push()` + `streaming=true` blocking render | `clear_streaming` message type | 3 |
+| All docs get download links | KB scores 0.61±0.02 — threshold useless | Keyword-grounding via Planner query keywords | 3 |
+| Delete not working | fv-delete-handler missing Lambda invoke permission | Added `lambda:InvokeFunction` for API GW | 3 |
+| Sidebar hamburger broken | Sidebar re-rendered on repaint, losing `sb-open` | Persistent `#app-sidebar` outside `#root` | 3 |
+| Old docs had null user_id | Email ingestion before user system | Batch DynamoDB update for all 31 docs | 3 |
+| JWT auth SECRET_HASH error | Old Cognito client had secret | New no-secret client `5j9s5557...` | 2 |
+| Wrong Bedrock model ID | Missing EU cross-region prefix | `eu.anthropic.claude-haiku-4-5-20251001-v1:0` | 2 |
+| Browser upload blocked | No CORS on S3 bucket | S3 CORS: `AllowedMethods=[GET,PUT,POST,DELETE,HEAD]` | 2 |
+| Chat has no memory | save_turn() wrote to DDB but was never read back | v13: load_short_term_memory + load_long_term_memory | 4 |
+| Email AI draft failing | Wrong Bedrock model ID (no `eu.` prefix) | Fixed model ID in fv-email-sender | 4 |
+| Email auth failing | JWT claims at `.claims` not `.jwt.claims` | Fixed claims path in get_uid() | 4 |
+| Email CORS blocked | No OPTIONS handler before auth | Added OPTIONS check at top of lambda_handler | 4 |
+| Email download links broken | Gmail wraps presigned URLs → breaks HMAC signature | Token-based redirect: `/download?token=uuid` | 4 |
 
 ---
+
+## Architecture Overview
+
+```
+Browser → CloudFront → S3 (SPA)
+Browser → API Gateway HTTP (JWT) → Lambda functions → DynamoDB / S3 / Bedrock / SES
+Browser → API Gateway WebSocket → fv-chat-handler → Bedrock KB + Claude Haiku
+S3 upload event → vector_processor_lambda → Textract → Titan Embed → S3 Vectors → Bedrock KB
+Email click → /download?token → fv-download-handler → DDB lookup → 302 → S3 presigned URL
+```
+
+## Chat Memory Architecture (v13)
+
+```
+Every turn:
+  1. load_short_term_memory(uid, sid, limit=6)
+     → DDB scan ChatSessions WHERE session_id=current
+     → last 6 Q+A pairs as Anthropic messages format
+     → passed to Planner AND Answerer as conversation history
+
+  2. load_long_term_memory(uid, sid, max_sessions=3)
+     → DDB scan ChatSessions WHERE session_id≠current
+     → last 3 sessions summarised into plain text block
+     → injected into Answerer system prompt as background context
+
+  3. plan(query, short_term_history)
+     → Planner sees conversation history → correctly handles follow-ups
+
+  4. tool_answer_question(query, chunks, push_fn, short_term, long_term)
+     → Answerer sees history + long-term context + RAG chunks
+     → streams answer token by token via WebSocket
+
+  5. save_turn(uid, sid, question, answer, sources=[...])
+     → stores Q+A + source filenames for future long-term recall
+```
+
+## Email Download Token Architecture (v3)
+
+```
+send_email():
+  for each doc_id:
+    → lookup doc in DocumentMetadata
+    → _store_download_token(uid, s3_key, filename)
+      → uuid token → DownloadTokens DDB (expires 24h)
+    → email link = https://API/download?token=uuid   ← Gmail-safe short URL
+
+User clicks link in Gmail:
+  → GET /download?token=uuid
+  → fv-download-handler Lambda
+  → lookup token in DownloadTokens DDB
+  → validate expiry
+  → generate fresh presigned URL (2-min expiry)
+  → 302 redirect → browser downloads file from S3
+
+WHY: Gmail wraps all HTML email links in links.google.com/url?q=...
+This breaks AWS HMAC signatures (URL changes = signature invalid = 403).
+Token URL is a plain UUID — Gmail can wrap it all it wants.
+```
 
 ## Deployment Quick Reference
 
 ```powershell
-# Deploy Lambda
-aws s3 cp fv-chat-v12.zip s3://family-docs-raw/lambda-packages/ --region eu-west-1
-aws lambda update-function-code --function-name fv-chat-handler `
-  --s3-bucket family-docs-raw --s3-key lambda-packages/fv-chat-v12.zip --region eu-west-1
+# Deploy any Lambda
+aws s3 cp <file>.zip s3://family-docs-raw/lambda-packages/<file>.zip --region eu-west-1
+aws lambda update-function-code --function-name <name> `
+  --s3-bucket family-docs-raw --s3-key lambda-packages/<file>.zip --region eu-west-1
 
 # Deploy UI
 aws s3 cp index.html s3://family-docs-ui/app/index.html --content-type text/html --region eu-west-1
 aws cloudfront create-invalidation --distribution-id E6U4KTUCXF1Q3 --paths "/app/*" --region us-east-1
 
-# Verify Lambda deployed
-aws lambda get-function-configuration --function-name fv-chat-handler --region eu-west-1 --query "[CodeSize,LastModified]"
+# Check Lambda config
+aws lambda get-function-configuration --function-name <name> --region eu-west-1
 ```
 
 ---
 
-## Repository Structure
-
-```
-familyvault-ai/
-├── README.md                              # This file
-├── lambdas/
-│   ├── fv-chat-handler/
-│   │   └── lambda_function.py            # v12 — Planner+Orchestrator
-│   ├── fv-upload-handler/
-│   │   └── lambda_function.py            # Presign, complete, status
-│   ├── fv-delete-handler/
-│   │   └── lambda_function.py            # Cascade delete S3+DDB+KB
-│   ├── fv-memory-handler/
-│   │   └── lambda_function.py            # Chat session management
-│   └── vector-processor/
-│       └── lambda_function.py            # OCR → embed → S3 Vectors
-├── ui/
-│   └── index.html                        # Complete SPA (v8 — latest)
-└── docs/
-    ├── architecture.md                   # Detailed architecture notes
-    ├── api-reference.md                  # All API endpoints
-    └── deployment.md                     # Deployment runbook
-```
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Runtime | Python 3.11 (Lambda) |
-| AI Model | Claude Haiku 4.5 (EU cross-region inference) |
-| Embeddings | Amazon Titan Embed Text v2 (1024-dim) |
-| Vector Store | Amazon S3 Vectors (cosine similarity) |
-| Knowledge Base | Amazon Bedrock KB |
-| Auth | Amazon Cognito User Pool + JWT |
-| Database | Amazon DynamoDB (PAY_PER_REQUEST) |
-| Storage | Amazon S3 (3 buckets) |
-| CDN | Amazon CloudFront + OAC |
-| Email | Amazon SES |
-| OCR | Amazon Textract |
-| Frontend | Vanilla JS SPA, CSS custom properties, SVG |
-| Fonts | Plus Jakarta Sans + JetBrains Mono |
-
----
-
-*Last updated: 22 March 2026 — Session 3 of development*
-*Next session: Sprint 1.5 (multi-user KB isolation) + Sprint 2 (family hierarchy backend)*
+*Last updated: 31 March 2026 — Session 4*
+*Sessions: Mar 21 (infra) + Mar 22 (chat/UI) + Mar 31 (memory + email fixes)*
+*Next: Deploy fv-download-handler → verify email links → Sprint 1.5 (KB isolation)*
