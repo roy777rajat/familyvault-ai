@@ -25,14 +25,18 @@
   <img src="https://img.shields.io/badge/Runtime-Python%203.11-blue">
   <img src="https://img.shields.io/badge/UI-Vanilla%20JS%20SPA-purple">
   <img src="https://img.shields.io/badge/AI-Claude%20Haiku%204.5-orange">
-  <img src="https://img.shields.io/badge/Session-4%20of%20N-red">
+  <img src="https://img.shields.io/badge/Session-5%20of%20N-red">
 </p>
 
 > **FOR NEXT SESSION — READ THIS FIRST**
-> This README is the single source of truth. Read the ✅ Completed and 🔧 Pending sections
-> before doing anything. The most critical pending item is deploying `fv-download-handler`
-> Lambda + creating `DownloadTokens` DDB table + wiring the `/download` API Gateway route.
-> All code is in this repo. All AWS resource IDs are in the table below.
+> This README is the single source of truth. Read ✅ Completed and 🔧 Pending before touching anything.
+>
+> **🚀 ONE-SHOT DEPLOY** — All 4 pending steps are automated. From repo root, just run:
+> ```powershell
+> .\scripts\deploy-download-handler.ps1
+> ```
+> This creates the DDB table, deploys the Lambda, wires the API Gateway route, verifies email-sender,
+> and runs a smoke test. Then do the end-to-end email link test and move to Sprint 1.5.
 
 ---
 
@@ -79,7 +83,7 @@
 | `fv-email-sender` | v3 (token links) | ✅ Deployed | 512 MB | 60s |
 | `fv-auth-handler` | v1 | ✅ Deployed | 256 MB | 30s |
 | `vector_processor_lambda` | v2 | ✅ Deployed | 1024 MB | 305s |
-| `fv-download-handler` | v1 | ❌ NOT DEPLOYED YET | 256 MB | 30s |
+| `fv-download-handler` | v1 | ❌ NOT DEPLOYED — run `scripts/deploy-download-handler.ps1` | 256 MB | 30s |
 
 ---
 
@@ -92,15 +96,22 @@
 | `UserProfiles` | `USER#<sub>` | — | ✅ Exists |
 | `EmailSentLog` | `USER#<sub>` | `EMAIL#<uuid>` | ✅ Exists |
 | `SecurityQuestions` | `USER#<sub>` | — | ✅ Exists |
-| `DownloadTokens` | `TOKEN#<uuid>` | — | ❌ NOT CREATED YET |
+| `DownloadTokens` | `TOKEN#<uuid>` | — | ❌ NOT CREATED — created by deploy script |
 
 ---
 
-## 🚨 NEXT SESSION — DO THESE FIRST (Pending Deployment)
+## 🚨 NEXT SESSION — START HERE
 
-These 4 steps are coded and committed to this repo. Just need to be deployed:
+### Option A — One-shot script (recommended)
+```powershell
+# From repo root, with AWS CLI configured:
+.\scripts\deploy-download-handler.ps1
+```
+The script handles all 4 steps: DDB table → Lambda → API Gateway route → email-sender verification → smoke test.
 
-### Step 1 — Create DownloadTokens DynamoDB table
+### Option B — Manual steps (if script fails)
+
+#### Step 1 — Create DownloadTokens DynamoDB table
 ```powershell
 aws dynamodb create-table `
   --table-name DownloadTokens `
@@ -108,11 +119,18 @@ aws dynamodb create-table `
   --key-schema AttributeName=PK,KeyType=HASH `
   --billing-mode PAY_PER_REQUEST `
   --region eu-west-1
+
+aws dynamodb update-time-to-live `
+  --table-name DownloadTokens `
+  --time-to-live-specification "Enabled=true,AttributeName=expires_epoch" `
+  --region eu-west-1
 ```
 
-### Step 2 — Deploy fv-download-handler Lambda (code in `lambdas/fv-download-handler/`)
+#### Step 2 — Deploy fv-download-handler Lambda
 ```powershell
-# Upload zip (build from lambdas/fv-download-handler/lambda_function.py)
+# Zip from lambdas/fv-download-handler/lambda_function.py
+Compress-Archive -Path lambdas\fv-download-handler\lambda_function.py -DestinationPath fv-download-handler.zip
+
 aws s3 cp fv-download-handler.zip s3://family-docs-raw/lambda-packages/ --region eu-west-1
 
 aws lambda create-function `
@@ -134,7 +152,7 @@ aws lambda add-permission `
   --region eu-west-1
 ```
 
-### Step 3 — Wire /download route in API Gateway (NO auth — token is the credential)
+#### Step 3 — Wire /download route in API Gateway (NO auth — token is the credential)
 ```powershell
 $LAMBDA_ARN = (aws lambda get-function-configuration `
   --function-name fv-download-handler --region eu-west-1 | ConvertFrom-Json).FunctionArn
@@ -153,12 +171,26 @@ aws apigatewayv2 create-route `
   --region eu-west-1
 ```
 
-### Step 4 — Verify fv-email-sender v3 is deployed (token-based links)
+#### Step 4 — Verify fv-email-sender v3 has API_URL env var
 ```powershell
 aws lambda get-function-configuration `
   --function-name fv-email-sender --region eu-west-1 `
-  --query "[CodeSize,LastModified,Environment.Variables]"
-# Should show API_URL env var. If not, redeploy fv-email-v3.zip
+  --query "Environment.Variables"
+# Must include API_URL. If missing, add it:
+aws lambda update-function-configuration `
+  --function-name fv-email-sender `
+  --environment "Variables={...,API_URL=https://1oj10740w0.execute-api.eu-west-1.amazonaws.com}" `
+  --region eu-west-1
+```
+
+### After deployment — verify end-to-end
+```powershell
+# 1. Smoke test: expect HTTP 400 (missing token)
+curl -s -o /dev/null -w "%{http_code}" https://1oj10740w0.execute-api.eu-west-1.amazonaws.com/download
+# → 400
+
+# 2. Full test: open app, send email with a doc, click the link in Gmail
+# → Should 302 redirect to S3 presigned URL → file downloads
 ```
 
 ---
@@ -189,28 +221,30 @@ aws lambda get-function-configuration `
   - Long-term: last 3 past sessions → compact summary injected into Answerer system prompt
   - Planner now memory-aware (resolves follow-ups like "download that one")
   - save_turn() now stores sources for richer long-term context
-- [x] fv-email-sender v3: fixed 3 bugs
-  - Bug A: Wrong Bedrock model ID (missing `eu.` prefix) → fixed
-  - Bug B: Wrong JWT claims path (.claims vs .jwt.claims) → fixed
-  - Bug C: Missing OPTIONS CORS handler → fixed
+- [x] fv-email-sender v3: fixed 3 bugs (model ID, JWT claims path, CORS OPTIONS)
   - **NEW**: Token-based download links in email (prevents Gmail URL mangling)
-- [x] fv-download-handler: new Lambda for token→presigned redirect
+- [x] fv-download-handler v1: coded, committed, **pending deployment**
   - Email contains clean `https://api.../download?token=uuid` (Gmail-safe)
   - Lambda resolves token from DownloadTokens DDB
   - Generates fresh 2-minute presigned URL on every click
   - 302 redirect → browser downloads directly from S3
 - [x] UI download link fix: iframe injection + programmatic click fallback
 - [x] Email UI improvements: validation, loading state, better draft context
-- [x] SES email verified, sending works (sandbox mode — only to verified addresses)
-- [x] GitHub repo: all code committed, README updated
+- [x] SES email verified, sending works (sandbox mode)
+- [x] `scripts/deploy-download-handler.ps1` — one-shot deploy script committed
+
+### Session 5 (next)
+- [ ] Run `scripts/deploy-download-handler.ps1`
+- [ ] Verify email download links end-to-end
+- [ ] Sprint 1.5: KB user_id isolation
 
 ---
 
 ## 🔧 Remaining Pending Work
 
-### Immediate (next session start)
-- [ ] **Deploy fv-download-handler** (see Steps 1-4 above)
-- [ ] **Verify email download links work** end-to-end after deployment
+### Immediate (Session 5 start)
+- [ ] **Run `.\scripts\deploy-download-handler.ps1`** (fv-download-handler + DownloadTokens DDB + API route)
+- [ ] **Verify email download links** end-to-end after deployment
 - [ ] **fv-fix.html** (UI with download fix) — deploy to S3 + CloudFront invalidation
 
 ### Sprint 1.5 — Multi-User KB Isolation (BEFORE adding new users)
@@ -237,7 +271,7 @@ aws lambda get-function-configuration `
 - [ ] Deduplicate documents (3x PolicyKit, 3x Passport uploaded multiple times)
 - [ ] fv-auth-handler CORS headers review
 - [ ] Chat history pagination (currently Limit=100 turns per scan)
-- [ ] SES production access request (currently sandbox — can only send to verified addresses)
+- [ ] SES production access request (currently sandbox)
 
 ---
 
@@ -305,7 +339,7 @@ send_email():
   for each doc_id:
     → lookup doc in DocumentMetadata
     → _store_download_token(uid, s3_key, filename)
-      → uuid token → DownloadTokens DDB (expires 24h)
+      → uuid token → DownloadTokens DDB (expires 24h, TTL on expires_epoch)
     → email link = https://API/download?token=uuid   ← Gmail-safe short URL
 
 User clicks link in Gmail:
@@ -326,7 +360,7 @@ Token URL is a plain UUID — Gmail can wrap it all it wants.
 ```powershell
 # Deploy any Lambda
 aws s3 cp <file>.zip s3://family-docs-raw/lambda-packages/<file>.zip --region eu-west-1
-aws lambda update-function-code --function-name <name> `
+aws lambda update-function-code --function-name <n> `
   --s3-bucket family-docs-raw --s3-key lambda-packages/<file>.zip --region eu-west-1
 
 # Deploy UI
@@ -334,11 +368,11 @@ aws s3 cp index.html s3://family-docs-ui/app/index.html --content-type text/html
 aws cloudfront create-invalidation --distribution-id E6U4KTUCXF1Q3 --paths "/app/*" --region us-east-1
 
 # Check Lambda config
-aws lambda get-function-configuration --function-name <name> --region eu-west-1
+aws lambda get-function-configuration --function-name <n> --region eu-west-1
 ```
 
 ---
 
-*Last updated: 31 March 2026 — Session 4*
-*Sessions: Mar 21 (infra) + Mar 22 (chat/UI) + Mar 31 (memory + email fixes)*
-*Next: Deploy fv-download-handler → verify email links → Sprint 1.5 (KB isolation)*
+*Last updated: 31 March 2026 — Session 5 prep*
+*Sessions: Mar 21 (infra) + Mar 22 (chat/UI) + Mar 31 (memory + email fixes + deploy script)*
+*Next: Run deploy script → verify email links → Sprint 1.5 (KB isolation)*
