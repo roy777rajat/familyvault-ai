@@ -1,17 +1,8 @@
 """
-FamilyVault AI — Email Sender v3
+FamilyVault AI — Email Sender v4
 
-Key fix in v3: email links use short token URLs instead of raw presigned URLs.
-Root cause: Gmail/Outlook safe-browsing proxies mangle AWS presigned URLs by
-wrapping them in redirect links (links.google.com/url?q=...) which breaks
-the HMAC signature and causes S3 to return 403 AccessDenied.
-
-Solution: token-based download redirect
-  1. send_email() calls _store_download_token() → DynamoDB DownloadTokens
-  2. Email link: https://API_GW/download?token=<uuid>  (short, Gmail-safe)
-  3. Click → fv-download-handler → 302 → fresh presigned URL → file downloads
-
-This pattern is used by Dropbox, Google Drive, etc. for the same reason.
+Fix in v4: EmailSentLog now sets read=False on every new email so it
+immediately appears in the Activity > Emails Sent screen.
 """
 import json, boto3, os, uuid
 from datetime import datetime, timezone, timedelta
@@ -107,7 +98,7 @@ def generate_draft(body, uid):
         })
 
 
-# ─── Token store ────────────────────────────────────────────────────────────────────
+# ─── Token store ─────────────────────────────────────────────────────────────
 def _store_download_token(uid, s3_key, filename, ttl_hours=24):
     token      = str(uuid.uuid4())
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
@@ -125,7 +116,7 @@ def _store_download_token(uid, s3_key, filename, ttl_hours=24):
         return None
 
 
-# ─── Send email ─────────────────────────────────────────────────────────────────────
+# ─── Send email ───────────────────────────────────────────────────────────────
 def send_email(uid, body):
     to_list    = body.get('to', [])
     cc_list    = body.get('cc', []) or []
@@ -136,7 +127,7 @@ def send_email(uid, body):
     if not to_list:    return err(400, 'At least one recipient (to) is required')
     if not email_body: return err(400, 'Email body is required')
 
-    # Build token-based links (not raw presigned URLs — Gmail would mangle them)
+    # Build token-based links
     doc_links = []
     table = dynamodb.Table('DocumentMetadata')
     for doc_id in doc_ids:
@@ -188,7 +179,7 @@ def send_email(uid, body):
         f'{links_section}'
         '<hr style="margin:24px 0;border:none;border-top:1px solid #f3f4f6">'
         '<p style="font-size:11px;color:#9ca3af;margin:0">'
-        'Sent via FamilyVault AI &middot; Powered by Amazon Bedrock &amp; AWS SES &middot; eu-west-1</p>'
+        'Sent via FamilyVault AI · Powered by Amazon Bedrock & AWS SES · eu-west-1</p>'
         '</div></body></html>'
     )
 
@@ -220,13 +211,15 @@ def send_email(uid, body):
         if 'MessageRejected' in err_msg: return err(400, f'SES rejected message: {err_msg}')
         return err(500, f'Email send failed: {err_msg}')
 
+    # ── Log to EmailSentLog — read=False so it appears in Activity immediately ──
     try:
         now = datetime.now(timezone.utc)
         dynamodb.Table('EmailSentLog').put_item(Item={
             'PK': f'USER#{uid}', 'SK': f'EMAIL#{now.isoformat()}',
             'message_id': message_id, 'to': to_list, 'cc': cc_list,
             'subject': subject, 'doc_ids': doc_ids,
-            'doc_count': len(doc_links), 'sent_at': now.isoformat()
+            'doc_count': len(doc_links), 'sent_at': now.isoformat(),
+            'read': False,   # ← v4 fix: always set so Activity tab shows it
         })
     except Exception as e:
         print(f'EmailSentLog write error (non-fatal): {e}')
