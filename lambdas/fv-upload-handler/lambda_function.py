@@ -32,18 +32,23 @@ def lambda_handler(event, context):
     return {"statusCode": 404, "headers": cors(), "body": json.dumps({"error": f"Not found: {method} {path}"})}
 
 def list_documents(user_id):
+    """Return ALL user docs — no uploaded_at filter. Sorted newest first."""
     table = dynamodb.Table("DocumentMetadata")
     result = table.scan(FilterExpression=Attr("user_id").eq(user_id) & Attr("deleted").ne(True))
     docs = result.get("Items", [])
     while "LastEvaluatedKey" in result:
-        result = table.scan(FilterExpression=Attr("user_id").eq(user_id) & Attr("deleted").ne(True), ExclusiveStartKey=result["LastEvaluatedKey"])
+        result = table.scan(
+            FilterExpression=Attr("user_id").eq(user_id) & Attr("deleted").ne(True),
+            ExclusiveStartKey=result["LastEvaluatedKey"]
+        )
         docs.extend(result.get("Items", []))
-    # Sort: docs with uploaded_at first (newest), then docs without
+    # Sort: docs with uploaded_at newest first, those without go to bottom
     docs.sort(key=lambda d: d.get("uploaded_at") or "", reverse=True)
     print(f"Returning {len(docs)} docs for {user_id}")
     return {"statusCode": 200, "headers": cors(), "body": json.dumps({"documents": docs}, default=str)}
 
 def get_notifications(user_id):
+    """Return email send history as notifications with unread count."""
     print(f"GET /notifications for {user_id}")
     table = dynamodb.Table("EmailSentLog")
     try:
@@ -75,12 +80,18 @@ def get_notifications(user_id):
         return {"statusCode": 500, "headers": cors(), "body": json.dumps({"error": str(e)})}
 
 def mark_notifications_read(user_id, body):
+    """Mark all or specific notifications as read."""
     table = dynamodb.Table("EmailSentLog")
     try:
         result = table.query(KeyConditionExpression=Key("PK").eq(f"USER#{user_id}"))
         ids = [item["SK"] for item in result.get("Items", []) if not item.get("read", False)]
         for sk in ids:
-            table.update_item(Key={"PK": f"USER#{user_id}", "SK": sk}, UpdateExpression="SET #r = :r", ExpressionAttributeNames={"#r": "read"}, ExpressionAttributeValues={":r": True})
+            table.update_item(
+                Key={"PK": f"USER#{user_id}", "SK": sk},
+                UpdateExpression="SET #r = :r",
+                ExpressionAttributeNames={"#r": "read"},
+                ExpressionAttributeValues={":r": True}
+            )
         return {"statusCode": 200, "headers": cors(), "body": json.dumps({"marked_read": len(ids)})}
     except Exception as e:
         return {"statusCode": 500, "headers": cors(), "body": json.dumps({"error": str(e)})}
@@ -95,7 +106,11 @@ def generate_presign(user_id, body):
     doc_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     s3_key = f"user={user_id}/year={now.year}/month={now.month:02d}/{doc_id}/{filename}"
-    dynamodb.Table("DocumentMetadata").put_item(Item={"PK": f"DOC#{doc_id}", "document_id": doc_id, "user_id": user_id, "filename": filename, "s3_key": s3_key, "content_type": content_type, "status": "PENDING", "deleted": False, "uploaded_at": now.isoformat()})
+    dynamodb.Table("DocumentMetadata").put_item(Item={
+        "PK": f"DOC#{doc_id}", "document_id": doc_id, "user_id": user_id,
+        "filename": filename, "s3_key": s3_key, "content_type": content_type,
+        "status": "PENDING", "deleted": False, "uploaded_at": now.isoformat()
+    })
     url = s3.generate_presigned_url("put_object", Params={"Bucket": BUCKET, "Key": s3_key, "ContentType": content_type}, ExpiresIn=300)
     return {"statusCode": 200, "headers": cors(), "body": json.dumps({"presigned_url": url, "document_id": doc_id, "s3_key": s3_key})}
 
@@ -103,7 +118,12 @@ def mark_complete(user_id, body):
     doc_id = body.get("document_id", "")
     if not doc_id:
         return {"statusCode": 400, "headers": cors(), "body": json.dumps({"error": "document_id required"})}
-    dynamodb.Table("DocumentMetadata").update_item(Key={"PK": f"DOC#{doc_id}"}, UpdateExpression="SET #s = :s", ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":s": "UPLOADED_PROCESSING"})
+    dynamodb.Table("DocumentMetadata").update_item(
+        Key={"PK": f"DOC#{doc_id}"},
+        UpdateExpression="SET #s = :s",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": "UPLOADED_PROCESSING"}
+    )
     return {"statusCode": 200, "headers": cors(), "body": json.dumps({"document_id": doc_id, "status": "UPLOADED_PROCESSING"})}
 
 def get_status(user_id, doc_id):
@@ -114,4 +134,8 @@ def get_status(user_id, doc_id):
         return {"statusCode": 500, "headers": cors(), "body": json.dumps({"error": str(e)})}
 
 def cors():
-    return {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Amz-Date,X-Api-Key", "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS"}
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Amz-Date,X-Api-Key",
+        "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS"
+    }

@@ -1,4 +1,11 @@
-<!-- See /ui/index.html — Full SPA. File too large to inline here. Deploy from outputs/fv-v8.html or fv-family.html -->
-<!-- Current version: fv-v8 with Family Vault screen, Agent Scratchpad, HTML table, Download cards -->
+<!-- See S3: s3://family-docs-ui/app/index.html for the live UI -->
+<!-- Current version: Session 6 fix — buildNotifications uses req(), allDocs for dashboard counts -->
 <!-- Deploy command: aws s3 cp index.html s3://family-docs-ui/app/index.html --content-type text/html --region eu-west-1 -->
 <!-- Config: API=https://1oj10740w0.execute-api.eu-west-1.amazonaws.com | WS=wss://4hnchd4nrk.execute-api.eu-west-1.amazonaws.com/production | CID=5j9s5557grmvt7gbuo8nopga8o -->
+<!-- Changes in Session 6: -->
+<!--   - buildNotifications() rewrote to use req('/notifications', {}, S.token) -->
+<!--   - loadDocs() now stores S.allDocs (all docs) and S.docs (sorted, no filter) -->
+<!--   - buildDashboard() uses S.allDocs.length for total counts -->
+<!--   - Activity tab: two tabs - Emails Sent (real API) + Documents (with source info) -->
+<!--   - Fixed: dashboard showing 0 docs (was filtering by uploaded_at) -->
+<!--   - Fixed: emails tab empty (was using raw fetch with localStorage token) -->
