@@ -3,68 +3,51 @@
 ## Session 1–6 (Mar 2026)
 - Initial infrastructure: Cognito, API Gateway, Lambda functions, DynamoDB, S3, CloudFront
 - fv-chat-handler with Bedrock KB integration
-- fv-upload-handler for document upload + notifications
-- fv-email-sender for SES email
-- Frontend SPA: Dashboard, Documents, Upload, Email, Memory, Activity, Profile, Settings screens
+- Frontend SPA: all screens built
 - WebSocket for real-time chat
 
 ## Session 7 (Apr 2–3 2026)
-### Fixes
-- Email-ingested docs missing `user_id`/`uploaded_at` — manually stamped 3 property tax docs
-- `ddb_updater.py` — UUID regex to handle both upload and email S3 key formats
-- Activity > Emails screen — fixed to use `req('/notifications', {}, S.token)` instead of raw localStorage fetch
-- Dashboard doc count — `S.allDocs` stores all docs, `S.docs` is filtered/sorted for display
-
-### Infrastructure
-- vector_processor_lambda redeployed with ddb_updater.py fix
-- fv-email-sender v4 — sets `read=False` on EmailSentLog
+- Email-ingested docs missing user_id/uploaded_at — manually stamped 3 property tax docs
+- ddb_updater.py UUID regex fix for both S3 key formats
+- Activity > Emails screen fixed
+- Dashboard doc count fixed with S.allDocs
 
 ## Session 8 (Apr 4 2026)
-### Feature: Live Cost Dashboard
-- New Lambda: `fv-cost-handler` — calls AWS Cost Explorer `ce.get_cost_and_usage()` live
-- New route: `GET /costs` (JWT auth)
-- IAM: `CostExplorerReadAccess` inline policy on FamilyVaultLambdaRole
-- UI: 💰 Costs nav item under Account section
-- 6 KPI cards, live insights banner, 3 tabs (Chart/Services/Table)
-- Date range picker + Daily/Monthly granularity toggle
-- ↻ Refresh button re-fetches live data
-- Status badge: Loading… → ✓ Live · date → Error
+- Live Cost Dashboard (💰 Costs) — fv-cost-handler Lambda + UI
+- Security audit + GitHub sensitive data redaction
+- Observability architecture design (Phase 1/2/3 roadmap)
 
-### Critical bugs fixed in this session
-1. `el()` helper rejects string onclick → TypeError: parameter 2 is not of type Object
-   - Fix: use `document.createElement()` + `element.onclick = function(){}`
-2. `div()` helper rejects real DOM elements as children
-   - Fix: don't mix helper functions and real DOM — use 100% pure DOM for new screens
-3. `req()` uses await without async → silent failure, API never called
-   - Fix: use direct `fetch()` with Authorization header
-4. File corruption from patching corrupted files
-   - Fix: always start from index-backup.html (101624 bytes, clean)
-5. `buildCosts` was last function in file → `IndexOf("function ")` returned -1 → corrupted file
-   - Fix: inject before `</script>` using `LastIndexOf("</script>")`, not between functions
+## Session 9 (Apr 4 2026)
+### Phase 1 Observability — fully deployed
 
-### Security fixes applied this session
-- Removed all hardcoded AWS resource IDs, account IDs, user emails, and Cognito client IDs from GitHub
-- PROJECT_CONTEXT.md now uses AWS CLI discovery commands instead of hardcoded values
-- See SECURITY.md for full audit report
+**Infrastructure:**
+- ChatObservability DynamoDB table (GSIs: user_id-ts-index, session_id-index)
+- ObservabilityConfig DynamoDB table (alert thresholds)
+- fv-chat-handler upgraded to v14 with full instrumentation
+- fv-observability-handler Lambda (GET/POST /observability, /observability/config)
+- SNS topic FamilyVaultAlerts → email subscription (confirm!)
+- 3 CloudWatch alarms: latency, errors, daily tokens
 
-### Deployment
-- index-final-clean.html (127401 bytes) — current live version
-- Built cleanly from index-backup.html in one PowerShell block
+**UI: 📊 Observability screen (4 tabs)**
+- Overview: p50/p95/p99 cards + daily latency + token charts
+- Traces: per-turn table — latency color-coded, tokens, KB chunks, tools, cost
+- Tools: tool usage breakdown + token stats
+- Alerts: current thresholds + live config form → updates DDB + CW alarms in real-time
 
-### Cost data summary (as of Apr 4 2026)
-- March 2026: $0.5793 (AI = 82%, Tax = 15%)
-- April 2026 (4 days): $0.2227
-- Apr 3 highest day: $0.1039
-- All infra = $0.00 (free tier)
-- Projected monthly at current rate: ~$1.67
+**What gets tracked per chat turn:**
+input_tokens, output_tokens, latency_ms, planner_latency_ms, answerer_latency_ms,
+kb_latency_ms, kb_chunks_retrieved, tools_called, model_id, status, estimated_cost_usd,
+query_len, answer_len, short_term_turns, long_term_sessions
+
+**CloudWatch metrics (FamilyVault/Chat namespace):**
+ChatLatencyMs, InputTokens, OutputTokens, TotalTokens, KBChunksRetrieved, ChatErrors
 
 ## Pending (Next Session)
-1. KB user_id isolation in fv-chat-handler (CRITICAL before new users)
-2. Vector metadata backfill for existing docs
-3. GSI on DocumentMetadata for user_id queries
-4. Email ingestion pipeline: stamp user_id + uploaded_at at write time
-5. Sprint 2: Family Hierarchy (FamilyTree table, Cognito Groups, invite/accept)
-6. Sprint 3: Guardrails (FamilyGuardrails table, Bedrock Guardrails)
-7. Cost Dashboard enhancements: token tracking, budget alerts, CSV export
-8. MFA enablement on Cognito User Pool
-9. Tighten IAM role to least-privilege (scope S3/DynamoDB to specific resources only)
+1. Confirm SNS subscription email at roy777rajat@gmail.com
+2. KB user_id isolation in fv-chat-handler (CRITICAL before new users)
+3. Vector metadata backfill for existing 34+ docs
+4. GSI on DocumentMetadata for user_id queries
+5. Email ingestion pipeline: stamp user_id + uploaded_at
+6. Phase 2 Observability: LangSmith integration (EU tenant)
+7. Sprint 2: Family Hierarchy
+8. Security hardening: IAM least-privilege, MFA, CORS tighten, S3 versioning
