@@ -1,38 +1,36 @@
 # FamilyVault AI — Master Project Context
 
 > **Last updated:** Session 8, Apr 4 2026  
-> **Purpose:** Complete project state for future Claude sessions — read this first before doing anything
+> **Purpose:** Complete project state for future Claude sessions — read this first before doing anything  
+> **⚠️ Security:** All sensitive IDs redacted. Real values are in AWS console / owner's secure notes only.
 
 ---
 
 ## 🌐 Live URLs
 | Resource | URL |
 |---|---|
-| App | https://d38ys5d9amc45p.cloudfront.net/app/index.html |
-| API Base | https://1oj10740w0.execute-api.eu-west-1.amazonaws.com |
-| WebSocket | wss://4hnchd4nrk.execute-api.eu-west-1.amazonaws.com/production |
+| App | https://[CLOUDFRONT_DOMAIN]/app/index.html |
+| API Base | https://[API_ID].execute-api.eu-west-1.amazonaws.com |
+| WebSocket | wss://[WS_API_ID].execute-api.eu-west-1.amazonaws.com/production |
+
+> To get real values: `aws apigatewayv2 get-apis --region eu-west-1`
 
 ---
 
 ## 🏗️ AWS Infrastructure
 
-| Resource | Value |
+| Resource | How to find |
 |---|---|
-| Account ID | 141571819444 |
-| IAM User | rajat-full-access |
+| Account ID | `aws sts get-caller-identity` |
 | Primary Region | eu-west-1 |
-| Cognito User Pool | eu-west-1_LUZKAYGwC |
-| Cognito Client ID | 5j9s5557grmvt7gbuo8nopga8o |
-| HTTP API ID | 1oj10740w0 |
-| WebSocket API ID | 4hnchd4nrk |
-| JWT Authorizer ID | kj2taa |
-| CloudFront Dist ID | E6U4KTUCXF1Q3 |
-| CloudFront Domain | d38ys5d9amc45p.cloudfront.net |
-| Lambda Role ARN | arn:aws:iam::141571819444:role/FamilyVaultLambdaRole |
-| Bedrock KB ID | PYV06IINGT |
-| Bedrock Data Source | JZ13ZYCSRL |
-| Root user sub | f2558464-7001-7088-8818-16f339b84fb6 |
-| Root user email | roy777rajat@gmail.com |
+| Cognito User Pool | `aws cognito-idp list-user-pools --max-results 10 --region eu-west-1` |
+| Cognito Client ID | `aws cognito-idp list-user-pool-clients --user-pool-id <pool-id> --region eu-west-1` |
+| HTTP API ID | `aws apigatewayv2 get-apis --region eu-west-1` |
+| WebSocket API ID | `aws apigatewayv2 get-apis --region eu-west-1` |
+| JWT Authorizer ID | `aws apigatewayv2 get-authorizers --api-id <api-id> --region eu-west-1` |
+| CloudFront Dist ID | `aws cloudfront list-distributions` |
+| Lambda Role ARN | `aws iam get-role --role-name FamilyVaultLambdaRole` |
+| Bedrock KB ID | `aws bedrock-agent list-knowledge-bases --region eu-west-1` |
 
 ### S3 Buckets
 | Bucket | Purpose |
@@ -53,13 +51,24 @@
 
 ## 🔌 API Gateway Routes
 
-| Route | Integration ID | Auth | Lambda |
-|---|---|---|---|
-| GET /documents | cw000te | JWT | fv-upload-handler |
-| GET /notifications | cw000te | JWT | fv-upload-handler |
-| POST /notifications/read | cw000te | JWT | fv-upload-handler |
-| GET /download | bllt1be | NONE | fv-download-handler |
-| GET /costs | 3jzgrsa | JWT | fv-cost-handler |
+| Route | Auth | Lambda |
+|---|---|---|
+| GET /documents | JWT | fv-upload-handler |
+| GET /notifications | JWT | fv-upload-handler |
+| POST /notifications/read | JWT | fv-upload-handler |
+| GET /download | NONE | fv-download-handler |
+| GET /costs | JWT | fv-cost-handler |
+| POST /upload/presign | JWT | fv-upload-handler |
+| POST /upload/complete | JWT | fv-upload-handler |
+| POST /email/send | JWT | fv-email-sender |
+| POST /email/draft | JWT | fv-email-sender |
+| GET /auth/profile | JWT | fv-auth-handler |
+| PUT /auth/profile | JWT | fv-auth-handler |
+| PUT /auth/change-password | JWT | fv-auth-handler |
+| GET /memory/sessions | JWT | fv-memory-handler |
+| GET /memory/long-term | JWT | fv-memory-handler |
+
+> To get integration IDs: `aws apigatewayv2 get-routes --api-id <api-id> --region eu-west-1`
 
 ---
 
@@ -103,7 +112,7 @@
 
 ### Key file
 - **S3 path:** s3://family-docs-ui/app/index.html
-- **Local backup:** E:\NEWTEMP\aws-api-mcp\workdir\index-backup.html (101624 bytes — CLEAN)
+- **Local backup:** index-backup.html (101624 bytes — CLEAN baseline)
 - **Latest deployed:** index-final-clean.html (127401 bytes)
 
 ### App helper functions — CRITICAL RULES
@@ -142,7 +151,7 @@ var nav = [
 ];
 ```
 
-### Screen switch (in repaint/render function)
+### Screen switch
 ```js
 case 'dashboard':     content=buildDashboard();      break;
 case 'documents':     content=buildDocuments();      break;
@@ -152,18 +161,7 @@ case 'memory':        content=buildMemory();         break;
 case 'notifications': content=buildNotifications();  break;
 case 'profile':       content=buildProfile();        break;
 case 'settings':      content=buildSettings();       break;
-case 'costs':         content=buildCosts();          break;  // Added Session 8
-```
-
-### State object (S)
-```js
-S.token        // Cognito JWT token
-S.user         // User profile
-S.docs         // Filtered/sorted documents (for display)
-S.allDocs      // All documents (for dashboard counts) — added Session 8
-S.docsLoaded   // Boolean
-S.screen       // Current screen name
-S.modal        // Modal state
+case 'costs':         content=buildCosts();          break;
 ```
 
 ### Token retrieval pattern for new screens
@@ -175,7 +173,9 @@ var token = (typeof S !== 'undefined' && S.token)
 
 ### API call pattern for new screens (safe, avoids req() issues)
 ```js
-fetch('https://1oj10740w0.execute-api.eu-west-1.amazonaws.com/your-route', {
+// Get API base URL from the app config (CFG.API) or look it up:
+// aws apigatewayv2 get-apis --region eu-west-1
+fetch(CFG.API + '/your-route', {
   headers: { Authorization: 'Bearer ' + token }
 })
 .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
@@ -187,7 +187,10 @@ fetch('https://1oj10740w0.execute-api.eu-west-1.amazonaws.com/your-route', {
 ```powershell
 # Deploy UI
 aws s3 cp your-file.html s3://family-docs-ui/app/index.html --content-type text/html --region eu-west-1
-aws cloudfront create-invalidation --distribution-id E6U4KTUCXF1Q3 --paths "/app/*" --region us-east-1
+
+# Get CloudFront dist ID first:
+# aws cloudfront list-distributions
+aws cloudfront create-invalidation --distribution-id <DIST_ID> --paths "/app/*" --region us-east-1
 
 # Deploy Lambda
 aws lambda update-function-code --function-name fv-xyz --zip-file fileb://fv-xyz.zip --region eu-west-1
@@ -228,36 +231,6 @@ $html | Out-File "index-new.html" -Encoding UTF8 -NoNewline
 | 🗂️ Services | Donut chart + service list with Free/AI/Tax/Other badges |
 | 📊 Table | Daily rows + totals row + projections box |
 
-### Service categorisation
-```python
-AI_SVCS    = {"Claude Haiku 4.5 (Amazon Bedrock Edition)",
-               "Claude 3 Haiku (Amazon Bedrock Edition)",
-               "Claude Sonnet 4 (Amazon Bedrock Edition)",
-               "Amazon Bedrock"}
-S3_SVCS    = {"Amazon Simple Storage Service"}
-TEXT_SVCS  = {"Amazon Textract"}
-INFRA_SVCS = {"AWS Lambda", "Amazon API Gateway", "Amazon DynamoDB",
-               "Amazon CloudFront", "Amazon Cognito",
-               "Amazon Simple Email Service", "Amazon Rekognition"}
-```
-
----
-
-## 📊 Cost Data Summary (as of Apr 4 2026)
-
-| Month | Total | AI Cost | AI% |
-|---|---|---|---|
-| March 2026 | $0.5793 | $0.4768 | 82% |
-| April 2026 (4 days) | $0.2227 | $0.0637 | 29% |
-
-| Day | Cost | Notes |
-|---|---|---|
-| Apr 3 2026 | $0.1039 | Highest single day |
-| Mar 22 | $0.1358 | 2nd highest |
-| Mar 7 | $0.0668 | Heavy Claude 3 Haiku use |
-
-**All infra services = $0.00 (free tier):** Lambda, DynamoDB, API GW, CloudFront, SES, Cognito, Textract, Rekognition
-
 ---
 
 ## 🐛 Bugs Fixed (Session History)
@@ -296,24 +269,30 @@ INFRA_SVCS = {"AWS Lambda", "Amazon API Gateway", "Amazon DynamoDB",
 - [ ] Per-family-member access controls
 
 ### Sprint 4 — Cost Dashboard Enhancements
-- [ ] Add token count tracking per conversation
+- [ ] Token count tracking per conversation
 - [ ] Cost alerts/budget threshold notifications
 - [ ] Per-user cost breakdown (when multi-user is live)
-- [ ] Historical trend comparison (this month vs last month)
+- [ ] Historical trend comparison (month vs last month)
 - [ ] Export cost report as CSV
 
 ---
 
-## 📁 Key Files in Workdir (E:\NEWTEMP\aws-api-mcp\workdir)
+## 🔧 Useful Debug Commands
 
-| File | Status | Notes |
-|---|---|---|
-| index-backup.html | ✅ CLEAN | 101624 bytes — always use as base for patches |
-| index-final-clean.html | ✅ DEPLOYED | 127401 bytes — current live version |
-| fv-cost-handler.zip | ✅ | Lambda zip for cost handler |
-| vector_processor_fixed.zip | ✅ | With ddb_updater fix |
-| ddb_updater.py | ✅ | Fixed UUID regex for both S3 key formats |
-| index-final-v2/v3/v4/v5/v6.html | ⚠️ CORRUPTED | Do not use — intermediate failed patches |
+```powershell
+# Get all resource IDs dynamically (no hardcoding needed)
+aws sts get-caller-identity
+aws apigatewayv2 get-apis --region eu-west-1
+aws cognito-idp list-user-pools --max-results 10 --region eu-west-1
+aws cloudfront list-distributions
+aws lambda list-functions --region eu-west-1
+
+# Check latest Lambda logs
+aws logs describe-log-streams --log-group-name /aws/lambda/fv-cost-handler --region eu-west-1 --order-by LastEventTime --descending --limit 3
+
+# Check DynamoDB doc (replace DOC#xxxx with real ID)
+aws dynamodb get-item --table-name DocumentMetadata --key '{"doc_id":{"S":"DOC#xxxx"}}' --region eu-west-1
+```
 
 ---
 
@@ -328,37 +307,11 @@ user=<uid>/year=YYYY/month=MM/<doc_id>/filename.pdf
 year=YYYY/month=MM/<doc_id>/filename.pdf
 ```
 
-The UUID regex in ddb_updater.py extracts doc_id from both.
-
----
-
-## 🔧 Useful Debug Commands
-
-```powershell
-# Check latest Lambda logs
-aws logs describe-log-streams --log-group-name /aws/lambda/fv-cost-handler --region eu-west-1 --order-by LastEventTime --descending --limit 3
-
-# Test cost Lambda directly
-aws lambda invoke --function-name fv-cost-handler --region eu-west-1 \
-  --payload '{"requestContext":{"http":{"method":"GET"}},"queryStringParameters":{"gran":"DAILY","from":"2026-04-01","to":"2026-04-04"}}' \
-  --invocation-type RequestResponse out.json
-
-# Check DynamoDB doc
-aws dynamodb get-item --table-name DocumentMetadata --key '{"doc_id":{"S":"DOC#xxxx"}}' --region eu-west-1
-
-# List all docs for user
-aws dynamodb query --table-name DocumentMetadata \
-  --index-name user_id-uploaded_at-index \
-  --key-condition-expression 'user_id = :u' \
-  --expression-attribute-values '{":u":{"S":"<user_sub>"}}' --region eu-west-1
-```
-
 ---
 
 ## 📦 GitHub Repo
 
-**Repo:** https://github.com/roy777rajat/familyvault-ai  
-**Latest commit:** Session 8 — Live Cost Dashboard  
+**Repo:** https://github.com/roy777rajat/familyvault-ai
 
 ### Key files in repo
 ```
@@ -369,30 +322,35 @@ lambdas/
   vector-processor/ddb_updater.py      ← UUID regex fix
 infra/
   api-gateway-routes.md                ← All routes documented
+  ARCHITECTURE.md                      ← System architecture
 ui/
   COST_DASHBOARD.md                    ← Cost Dashboard feature docs
+  CODING_RULES.md                      ← Critical UI coding rules
 PROJECT_CONTEXT.md                     ← THIS FILE
+SESSIONS.md                            ← Session history
 ```
 
 ---
 
 ## 💡 Session Workflow (for future Claude sessions)
 
-1. **Read PROJECT_CONTEXT.md first** (this file) — full state
-2. **Read the relevant lambda file** for the feature being worked on
-3. **Always download fresh index.html** before patching UI:
+1. **Read PROJECT_CONTEXT.md first** (this file)
+2. **Discover resource IDs dynamically** — never hardcode, always query AWS:
+   ```powershell
+   aws apigatewayv2 get-apis --region eu-west-1
+   aws cloudfront list-distributions
+   ```
+3. **Download fresh index.html** before patching UI:
    ```powershell
    aws s3api get-object --bucket family-docs-ui --key app/index.html --region eu-west-1 current.html
    ```
-4. **Always patch from index-backup.html** not from a previously patched file
-5. **Always verify before deploying:**
-   - Nav: `($html -match "s:'costs'")`
-   - Screen case: `($html -match "case 'costs'")`
-   - No bad helpers: `(-not ($html -match "el\('span'"))`
-   - Function present: `($html -match "function buildXxx")`
-6. **Deploy and invalidate:**
+4. **Always patch from index-backup.html** not a previously patched file
+5. **Verify before deploying** (all must be True):
    ```powershell
-   aws s3 cp file.html s3://family-docs-ui/app/index.html --content-type text/html --region eu-west-1
-   aws cloudfront create-invalidation --distribution-id E6U4KTUCXF1Q3 --paths "/app/*" --region us-east-1
+   Write-Host "Nav:" ($html -match "s:'newscreen'")
+   Write-Host "Case:" ($html -match "case 'newscreen'")
+   Write-Host "Function:" ($html -match "function buildNewScreen")
+   Write-Host "No el() errors:" (-not ($html -match "el\('(span|button)',\{onclick:"))
    ```
-7. **Update PROJECT_CONTEXT.md** with session summary before ending
+6. **Deploy and invalidate**
+7. **Update PROJECT_CONTEXT.md + SESSIONS.md** before ending session

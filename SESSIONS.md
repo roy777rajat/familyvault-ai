@@ -22,7 +22,7 @@
 ## Session 8 (Apr 4 2026)
 ### Feature: Live Cost Dashboard
 - New Lambda: `fv-cost-handler` — calls AWS Cost Explorer `ce.get_cost_and_usage()` live
-- New route: `GET /costs` (JWT auth, integration 3jzgrsa, route ju6w4kq)
+- New route: `GET /costs` (JWT auth)
 - IAM: `CostExplorerReadAccess` inline policy on FamilyVaultLambdaRole
 - UI: 💰 Costs nav item under Account section
 - 6 KPI cards, live insights banner, 3 tabs (Chart/Services/Table)
@@ -41,6 +41,11 @@
    - Fix: always start from index-backup.html (101624 bytes, clean)
 5. `buildCosts` was last function in file → `IndexOf("function ")` returned -1 → corrupted file
    - Fix: inject before `</script>` using `LastIndexOf("</script>")`, not between functions
+
+### Security fixes applied this session
+- Removed all hardcoded AWS resource IDs, account IDs, user emails, and Cognito client IDs from GitHub
+- PROJECT_CONTEXT.md now uses AWS CLI discovery commands instead of hardcoded values
+- See SECURITY.md for full audit report
 
 ### Deployment
 - index-final-clean.html (127401 bytes) — current live version
@@ -61,3 +66,5 @@
 5. Sprint 2: Family Hierarchy (FamilyTree table, Cognito Groups, invite/accept)
 6. Sprint 3: Guardrails (FamilyGuardrails table, Bedrock Guardrails)
 7. Cost Dashboard enhancements: token tracking, budget alerts, CSV export
+8. MFA enablement on Cognito User Pool
+9. Tighten IAM role to least-privilege (scope S3/DynamoDB to specific resources only)
