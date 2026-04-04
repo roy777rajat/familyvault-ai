@@ -28,11 +28,16 @@ def lambda_handler(event, context):
 
     end_excl = (datetime.fromisoformat(date_to) + timedelta(days=1)).date().isoformat()
 
-    AI_SVCS    = {"Claude Haiku 4.5 (Amazon Bedrock Edition)","Claude 3 Haiku (Amazon Bedrock Edition)","Claude Sonnet 4 (Amazon Bedrock Edition)","Amazon Bedrock"}
+    AI_SVCS    = {"Claude Haiku 4.5 (Amazon Bedrock Edition)",
+                  "Claude 3 Haiku (Amazon Bedrock Edition)",
+                  "Claude Sonnet 4 (Amazon Bedrock Edition)",
+                  "Amazon Bedrock"}
     S3_SVCS    = {"Amazon Simple Storage Service"}
     TEXT_SVCS  = {"Amazon Textract"}
-    INFRA_SVCS = {"AWS Lambda","Amazon API Gateway","Amazon DynamoDB","Amazon CloudFront",
-                  "Amazon Cognito","Amazon Simple Email Service","Amazon SES","Amazon Rekognition"}
+    INFRA_SVCS = {"AWS Lambda","Amazon API Gateway","Amazon DynamoDB",
+                  "Amazon CloudFront","Amazon Cognito",
+                  "Amazon Simple Email Service","Amazon SES",
+                  "Amazon Rekognition"}
 
     try:
         resp = ce.get_cost_and_usage(
@@ -51,18 +56,20 @@ def lambda_handler(event, context):
 
     for period in resp["ResultsByTime"]:
         day_start = period["TimePeriod"]["Start"]
-        day = {"date":day_start,"ai":0,"s3":0,"textract":0,"infra":0,"tax":0,"other":0,"total":0,"estimated":period.get("Estimated",False)}
+        day = {"date":day_start,"ai":0,"s3":0,"textract":0,
+               "infra":0,"tax":0,"other":0,"total":0,
+               "estimated":period.get("Estimated",False)}
         for grp in period["Groups"]:
             svc  = grp["Keys"][0]
             cost = float(grp["Metrics"]["BlendedCost"]["Amount"])
             if cost <= 0: continue
             svc_agg[svc] = svc_agg.get(svc, 0) + cost
-            if svc in AI_SVCS:    day["ai"]      += cost
-            elif svc in S3_SVCS:  day["s3"]      += cost
-            elif svc in TEXT_SVCS:day["textract"] += cost
-            elif svc in INFRA_SVCS:day["infra"]   += cost
-            elif svc == "Tax":    day["tax"]      += cost
-            else:                  day["other"]    += cost
+            if svc in AI_SVCS:     day["ai"]       += cost
+            elif svc in S3_SVCS:   day["s3"]       += cost
+            elif svc in TEXT_SVCS: day["textract"]  += cost
+            elif svc in INFRA_SVCS:day["infra"]     += cost
+            elif svc == "Tax":     day["tax"]       += cost
+            else:                  day["other"]      += cost
             day["total"] += cost
         for k in ("ai","s3","textract","infra","tax","other","total"):
             day[k] = round(day[k], 6)
@@ -83,7 +90,9 @@ def lambda_handler(event, context):
     )
     monthly = []
     for period in monthly_resp["ResultsByTime"]:
-        m = {"month":period["TimePeriod"]["Start"][:7],"total":0,"ai":0,"estimated":period.get("Estimated",False)}
+        m = {"month":period["TimePeriod"]["Start"][:7],
+             "total":0,"ai":0,
+             "estimated":period.get("Estimated",False)}
         for grp in period["Groups"]:
             svc  = grp["Keys"][0]
             cost = float(grp["Metrics"]["BlendedCost"]["Amount"])
