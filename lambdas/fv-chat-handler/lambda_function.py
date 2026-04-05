@@ -6,6 +6,7 @@ What changed from v13:
   - Publishes CloudWatch custom metrics: ChatLatencyMs, InputTokens, OutputTokens,
     KBChunksRetrieved, ChatErrors, TotalTokens (namespace: FamilyVault/Chat)
   - Estimated cost: input $0.80/MTok, output $4.00/MTok (Claude Haiku 4.5 pricing)
+  - Fix: removed backslash inside f-string (Python 3.11 incompatible)
 """
 import json, boto3, os, uuid, re, time
 from datetime import datetime, timezone
@@ -21,7 +22,6 @@ BUCKET         = os.environ.get("BUCKET", "family-docs-raw")
 PLANNER_MODEL  = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 ANSWERER_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 
-# Cost per million tokens (Claude Haiku 4.5)
 COST_INPUT_PER_MTOK  = 0.80
 COST_OUTPUT_PER_MTOK = 4.00
 
@@ -43,12 +43,11 @@ def estimate_cost(input_tokens, output_tokens):
     )
 
 def write_observation(uid, sid, obs):
-    """Write a structured observation to ChatObservability table."""
     try:
         ts = datetime.now(timezone.utc).isoformat()
         record = {
-            "PK": f"USER#{uid}",
-            "SK": f"OBS#{ts}#{str(uuid.uuid4())[:8]}",
+            "PK": "USER#" + uid,
+            "SK": "OBS#" + ts + "#" + str(uuid.uuid4())[:8],
             "user_id": uid,
             "session_id": sid,
             "ts": ts,
@@ -73,32 +72,30 @@ def write_observation(uid, sid, obs):
             "long_term_sessions":  int(obs.get("long_term_sessions", 0)),
         }
         dynamodb.Table("ChatObservability").put_item(Item=record)
-        print(f"OBS written: latency={record['latency_ms']}ms tokens={record['total_tokens']}")
+        print("OBS written: latency=" + str(record["latency_ms"]) + "ms tokens=" + str(record["total_tokens"]))
     except Exception as e:
-        print(f"OBS write error: {e}")
+        print("OBS write error: " + str(e))
 
 def publish_metrics(uid, obs):
-    """Publish custom CloudWatch metrics."""
     try:
         dims = [{"Name": "UserId", "Value": uid}]
         metrics = [
-            {"MetricName": "ChatLatencyMs",       "Value": float(obs.get("latency_ms", 0)),          "Unit": "Milliseconds", "Dimensions": dims},
-            {"MetricName": "InputTokens",          "Value": float(obs.get("input_tokens", 0)),         "Unit": "Count",        "Dimensions": dims},
-            {"MetricName": "OutputTokens",         "Value": float(obs.get("output_tokens", 0)),        "Unit": "Count",        "Dimensions": dims},
-            {"MetricName": "TotalTokens",          "Value": float(obs.get("input_tokens", 0) + obs.get("output_tokens", 0)), "Unit": "Count", "Dimensions": dims},
-            {"MetricName": "KBChunksRetrieved",    "Value": float(obs.get("kb_chunks_retrieved", 0)),  "Unit": "Count",        "Dimensions": dims},
-            {"MetricName": "ChatErrors",           "Value": 1.0 if obs.get("status") == "error" else 0.0, "Unit": "Count", "Dimensions": dims},
+            {"MetricName": "ChatLatencyMs",    "Value": float(obs.get("latency_ms", 0)),          "Unit": "Milliseconds", "Dimensions": dims},
+            {"MetricName": "InputTokens",       "Value": float(obs.get("input_tokens", 0)),         "Unit": "Count",        "Dimensions": dims},
+            {"MetricName": "OutputTokens",      "Value": float(obs.get("output_tokens", 0)),        "Unit": "Count",        "Dimensions": dims},
+            {"MetricName": "TotalTokens",       "Value": float(obs.get("input_tokens", 0) + obs.get("output_tokens", 0)), "Unit": "Count", "Dimensions": dims},
+            {"MetricName": "KBChunksRetrieved", "Value": float(obs.get("kb_chunks_retrieved", 0)),  "Unit": "Count",        "Dimensions": dims},
+            {"MetricName": "ChatErrors",        "Value": 1.0 if obs.get("status") == "error" else 0.0, "Unit": "Count",    "Dimensions": dims},
         ]
-        # Also publish without dimension for account-wide aggregates
         global_metrics = [
-            {"MetricName": "ChatLatencyMs",  "Value": float(obs.get("latency_ms", 0)),  "Unit": "Milliseconds"},
-            {"MetricName": "TotalTokens",    "Value": float(obs.get("input_tokens", 0) + obs.get("output_tokens", 0)), "Unit": "Count"},
-            {"MetricName": "ChatErrors",     "Value": 1.0 if obs.get("status") == "error" else 0.0, "Unit": "Count"},
+            {"MetricName": "ChatLatencyMs", "Value": float(obs.get("latency_ms", 0)),  "Unit": "Milliseconds"},
+            {"MetricName": "TotalTokens",   "Value": float(obs.get("input_tokens", 0) + obs.get("output_tokens", 0)), "Unit": "Count"},
+            {"MetricName": "ChatErrors",    "Value": 1.0 if obs.get("status") == "error" else 0.0, "Unit": "Count"},
         ]
         cw.put_metric_data(Namespace="FamilyVault/Chat", MetricData=metrics + global_metrics)
-        print(f"CW metrics published: latency={obs.get('latency_ms')}ms")
+        print("CW metrics published: latency=" + str(obs.get("latency_ms")) + "ms")
     except Exception as e:
-        print(f"CW metrics error: {e}")
+        print("CW metrics error: " + str(e))
 
 # ==============================================================
 #  MEMORY LAYER
@@ -123,10 +120,10 @@ def load_short_term_memory(uid, sid, limit=6):
                 messages.append({"role": "user",      "content": q})
             if a and not a.startswith("[Document list"):
                 messages.append({"role": "assistant", "content": a})
-        print(f"Short-term memory: {len(items)} turns for session {sid}")
+        print("Short-term memory: " + str(len(items)) + " turns for session " + sid)
         return messages
     except Exception as e:
-        print(f"Short-term memory error: {e}")
+        print("Short-term memory error: " + str(e))
         return []
 
 
@@ -154,29 +151,29 @@ def load_long_term_memory(uid, current_sid, max_sessions=3):
             first_ts = sess_items[0].get("created_at", "")
             try:
                 date_label = datetime.fromisoformat(first_ts.replace("Z", "+00:00")).strftime("%d %b %Y")
-            except:
+            except Exception:
                 date_label = first_ts[:10]
-            lines.append(f"\n[Session - {date_label}]")
+            lines.append("\n[Session - " + date_label + "]")
             for item in sess_items[-4:]:
                 q = (item.get("question") or "").strip()
                 a = (item.get("answer") or "").strip()
                 sources = item.get("sources", [])
                 if q and a and not a.startswith("[Document list"):
-                    lines.append(f"Q: {q}")
+                    lines.append("Q: " + q)
                     a_short = a[:300] + "..." if len(a) > 300 else a
-                    lines.append(f"A: {a_short}")
+                    lines.append("A: " + a_short)
                     if sources:
-                        lines.append(f"   (Sources: {', '.join(sources[:3])})")
+                        lines.append("   (Sources: " + ", ".join(sources[:3]) + ")")
         if len(lines) <= 1:
             return ""
-        print(f"Long-term memory: {len(sorted_sessions)} past sessions")
+        print("Long-term memory: " + str(len(sorted_sessions)) + " past sessions")
         return "\n".join(lines)
     except Exception as e:
-        print(f"Long-term memory error: {e}")
+        print("Long-term memory error: " + str(e))
         return ""
 
 # ==============================================================
-#  HELPERS  (unchanged from v13)
+#  HELPERS
 # ==============================================================
 
 def get_user_docs(uid):
@@ -210,7 +207,7 @@ def fmt_date(iso):
     if not iso: return "\u2014"
     try:
         return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%d %b %Y")
-    except:
+    except Exception:
         return iso[:10]
 
 def sort_docs(docs):
@@ -221,16 +218,16 @@ def make_presigned(s3_key, filename, expiry=86400):
         return s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": BUCKET, "Key": s3_key,
-                    "ResponseContentDisposition": f'attachment; filename="{filename}"'},
+                    "ResponseContentDisposition": "attachment; filename=\"" + filename + "\""},
             ExpiresIn=expiry
         )
     except Exception as e:
-        print(f"Presign err {s3_key}: {e}")
+        print("Presign err " + s3_key + ": " + str(e))
         return None
 
 def build_doc_table(docs, filter_label=None):
-    title = (f"Documents matching '{filter_label}' ({len(docs)} found)"
-             if filter_label else f"Your Documents ({len(docs)} total)")
+    title = ("Documents matching '" + filter_label + "' (" + str(len(docs)) + " found)"
+             if filter_label else "Your Documents (" + str(len(docs)) + " total)")
     rows = ""
     for i, d in enumerate(sort_docs(docs), 1):
         fname = d.get("filename", "\u2014")
@@ -240,14 +237,14 @@ def build_doc_table(docs, filter_label=None):
         st    = d.get("status", "\u2014")
         sc    = "st-ok" if st == "INDEXED" else "st-proc" if "PROCESS" in st else "st-pend"
         sl    = "Indexed" if st == "INDEXED" else "Processing" if "PROCESS" in st else st
-        rows += (f"<tr><td class='tsl'>{i}</td><td class='tfn'>{fname}</td>"
-                 f"<td class='tca'>{cat}</td><td class='tsr'>{src}</td>"
-                 f"<td class='tdt'>{date}</td><td><span class='tbl-st {sc}'>{sl}</span></td></tr>")
-    return (f'<div class="doc-table-wrap"><div class="doc-table-hd">{title}</div>'
-            f'<div class="doc-table-scroll"><table class="doc-table">'
-            f'<thead><tr><th>Sl</th><th>Document Name</th><th>Category</th>'
-            f'<th>Source</th><th>Date</th><th>Status</th></tr></thead>'
-            f'<tbody>{rows}</tbody></table></div></div>')
+        rows += ("<tr><td class='tsl'>" + str(i) + "</td><td class='tfn'>" + fname + "</td>"
+                 "<td class='tca'>" + cat + "</td><td class='tsr'>" + src + "</td>"
+                 "<td class='tdt'>" + date + "</td><td><span class='tbl-st " + sc + "'>" + sl + "</span></td></tr>")
+    return ('<div class="doc-table-wrap"><div class="doc-table-hd">' + title + '</div>'
+            '<div class="doc-table-scroll"><table class="doc-table">'
+            '<thead><tr><th>Sl</th><th>Document Name</th><th>Category</th>'
+            '<th>Source</th><th>Date</th><th>Status</th></tr></thead>'
+            '<tbody>' + rows + '</tbody></table></div></div>')
 
 def save_turn(uid, sid, question, answer, sources=None):
     try:
@@ -262,10 +259,10 @@ def save_turn(uid, sid, question, answer, sources=None):
             "deleted": False
         })
     except Exception as e:
-        print(f"DDB save: {e}")
+        print("DDB save: " + str(e))
 
 # ==============================================================
-#  PLANNER (unchanged from v13)
+#  PLANNER
 # ==============================================================
 
 PLANNER_SYSTEM = """You are the Planner for FamilyVault AI, a personal document assistant.
@@ -273,11 +270,11 @@ Your job: read the user's LATEST question and produce a JSON execution plan.
 IMPORTANT: Use conversation history to resolve follow-up references.
 
 Available tools:
-1. document_list    — Fetch user document list from DynamoDB
-2. search_documents — Semantic search via Bedrock KB
-3. download_document— Generate presigned download links
-4. answer_question  — Generate natural language answer
-5. out_of_scope     — Unrelated to documents
+1. document_list    - Fetch user document list from DynamoDB
+2. search_documents - Semantic search via Bedrock KB
+3. download_document- Generate presigned download links
+4. answer_question  - Generate natural language answer
+5. out_of_scope     - Unrelated to documents
 
 RULES:
 - Return ONLY valid JSON array. No markdown, no explanation.
@@ -316,10 +313,10 @@ def plan(query, short_term_history):
         raw = re.sub(r'^```[a-z]*\n?', '', raw, flags=re.M)
         raw = re.sub(r'\n?```$', '', raw, flags=re.M)
         steps = json.loads(raw)
-        print(f"Plan: {steps}")
+        print("Plan: " + str(steps))
         return steps
     except Exception as e:
-        print(f"Planner error: {e}")
+        print("Planner error: " + str(e))
         return [{"tool": "search_documents", "query": query, "reason": "fallback"},
                 {"tool": "answer_question", "reason": "fallback"}]
 
@@ -336,7 +333,7 @@ def tool_search_documents(query, min_score=0.50):
             retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 8}}
         )
     except Exception as e:
-        print(f"KB error: {e}")
+        print("KB error: " + str(e))
         return [], []
     raw_results = res.get("retrievalResults", [])
     chunks, sources, seen = [], [], set()
@@ -370,8 +367,8 @@ def tool_document_list(uid, filter_query=None):
     keywords = [w for w in re.split(r'\W+', fq) if len(w) > 1 and w not in stops]
     if not keywords: return all_docs, False
     matched = [d for d in all_docs if any(
-        kw in (f"{(d.get('filename','') or '').lower()} {doc_category(d.get('filename','')).lower()} "
-               f"{(d.get('subject','') or '').lower()} {(d.get('sender_email','') or '').lower()}")
+        kw in ((d.get("filename","") or "").lower() + " " + doc_category(d.get("filename","")).lower() + " "
+               + (d.get("subject","") or "").lower() + " " + (d.get("sender_email","") or "").lower())
         for kw in keywords
     )]
     return matched, True
@@ -417,14 +414,10 @@ def tool_download_document(all_docs, grounded_sources, search_queries=None):
     return links
 
 # ==============================================================
-#  TOOL: answer_question  — now counts tokens
+#  TOOL: answer_question
 # ==============================================================
 
 def tool_answer_question(query, all_chunks, push_fn, short_term_history, long_term_summary, obs):
-    """
-    Streams an answer. Now returns (text, input_tokens, output_tokens).
-    obs dict is mutated to accumulate token counts.
-    """
     if not all_chunks:
         rag_context = "No relevant document content was found for this query."
     else:
@@ -432,28 +425,27 @@ def tool_answer_question(query, all_chunks, push_fn, short_term_history, long_te
         for ch in all_chunks[:6]:
             fname = ch.get("filename", "")
             score = ch.get("score", 0)
-            src   = f"[Source: {fname} | Score: {score:.3f}]" if fname else ""
-            ctx_parts.append(f"{src}\n{ch['text']}")
+            src   = "[Source: " + fname + " | Score: " + str(round(score, 3)) + "]" if fname else ""
+            ctx_parts.append(src + "\n" + ch["text"])
         rag_context = "\n\n---\n\n".join(ctx_parts)
 
     long_term_block = ""
     if long_term_summary:
-        long_term_block = f"\n{long_term_summary}\n\nUse the above past conversations as BACKGROUND CONTEXT only.\n"
+        long_term_block = "\n" + long_term_summary + "\n\nUse the above past conversations as BACKGROUND CONTEXT only.\n"
 
-    system = f"""You are FamilyVault AI \u2014 a warm, professional personal document assistant.
-{long_term_block}
-RETRIEVED DOCUMENT CONTENT:
-{rag_context}
-
-STRICT RULES:
-1. Answer ONLY from retrieved document content. Never invent facts.
-2. Be specific \u2014 quote exact values when found.
-3. Mention which document the info comes from.
-4. If content doesn't answer: say warmly that you couldn't find it.
-5. NEVER use markdown bold (**) or bullet stars. Plain sentences only.
-6. NEVER say "I don't have download links".
-7. NEVER start with "Based on retrieved content".
-8. Keep responses concise, warm, professional."""
+    system = ("You are FamilyVault AI \u2014 a warm, professional personal document assistant.\n"
+              + long_term_block
+              + "\nRETRIEVED DOCUMENT CONTENT:\n"
+              + rag_context
+              + "\n\nSTRICT RULES:\n"
+              "1. Answer ONLY from retrieved document content. Never invent facts.\n"
+              "2. Be specific \u2014 quote exact values when found.\n"
+              "3. Mention which document the info comes from.\n"
+              "4. If content doesn't answer: say warmly that you couldn't find it.\n"
+              "5. NEVER use markdown bold (**) or bullet stars. Plain sentences only.\n"
+              "6. NEVER say \"I don't have download links\".\n"
+              "7. NEVER start with \"Based on retrieved content\".\n"
+              "8. Keep responses concise, warm, professional.")
 
     messages = list(short_term_history)
     messages.append({"role": "user", "content": query})
@@ -479,7 +471,6 @@ STRICT RULES:
                 if token:
                     full += token
                     push_fn({"type": "token", "content": token})
-            # Extract token usage from message_delta event
             elif chunk.get("type") == "message_start":
                 usage = chunk.get("message", {}).get("usage", {})
                 input_tokens += usage.get("input_tokens", 0)
@@ -487,7 +478,7 @@ STRICT RULES:
                 usage = chunk.get("usage", {})
                 output_tokens += usage.get("output_tokens", 0)
     except Exception as e:
-        print(f"Answerer error: {e}")
+        print("Answerer error: " + str(e))
         msg = "Sorry, I had trouble generating a response. Please try again."
         push_fn({"type": "token", "content": msg})
         full = msg
@@ -500,7 +491,7 @@ STRICT RULES:
     return full
 
 # ==============================================================
-#  ORCHESTRATOR — instrumented
+#  ORCHESTRATOR
 # ==============================================================
 
 def orchestrate(query, uid, sid, push):
@@ -527,11 +518,16 @@ def orchestrate(query, uid, sid, push):
     obs["planner_latency_ms"] = int((time.time() - t_plan) * 1000)
     obs["tools_called"] = [s.get("tool") for s in steps]
 
+    # Build plan summary without backslash in f-string
+    plan_lines = []
+    for i, s in enumerate(steps, 1):
+        line = "  " + str(i) + ". " + str(s.get("tool", "?"))
+        q = s.get("query")
+        if q:
+            line += " query=" + q
+        plan_lines.append(line)
     push({"type": "scratchpad", "event": "plan",
-          "content": "Plan:\n" + "\n".join(
-              f"  {i}. {s.get('tool')}" + (f' query={s[\"query\"]}' if s.get('query') else '')
-              for i, s in enumerate(steps, 1)
-          )})
+          "content": "Plan:\n" + "\n".join(plan_lines)})
 
     all_chunks, all_sources, score_map = [], [], {}
     all_docs, full_reply, search_queries = None, "", []
@@ -545,16 +541,16 @@ def orchestrate(query, uid, sid, push):
 
     for step in steps:
         tool = step.get("tool")
-        print(f"Orchestrator -> {tool}")
+        print("Orchestrator -> " + str(tool))
         push({"type": "scratchpad", "event": "step",
-              "content": f"Executing: {tool} ({(step.get('query') or step.get('filter') or step.get('reason',''))[:80]})"})
+              "content": "Executing: " + str(tool) + " (" + (step.get("query") or step.get("filter") or step.get("reason",""))[:80] + ")"})
 
         if tool == "document_list":
             filter_q = step.get("filter", "").strip()
             list_docs, is_filtered = tool_document_list(uid, filter_q)
             if not all_docs: all_docs = get_user_docs(uid)
             if not list_docs and is_filtered:
-                push({"type": "token", "content": f"I couldn't find any documents matching '{filter_q}' in your vault."})
+                push({"type": "token", "content": "I couldn't find any documents matching '" + filter_q + "' in your vault."})
             elif not list_docs:
                 push({"type": "token", "content": "I don't see any documents in your vault yet. Upload documents using the Upload section."})
             else:
@@ -563,7 +559,7 @@ def orchestrate(query, uid, sid, push):
                 if not any(s["tool"] in ("search_documents","answer_question","download_document") for s in steps):
                     push({"type": "scratchpad", "event": "done", "content": ""})
                     push({"type": "final", "sources": [], "session_id": sid})
-                    save_turn(uid, sid, query, f"[Document list: {len(list_docs)} docs filter='{filter_q}']")
+                    save_turn(uid, sid, query, "[Document list: " + str(len(list_docs)) + " docs filter='" + filter_q + "']")
                     obs["latency_ms"] = int((time.time() - t_start) * 1000)
                     write_observation(uid, sid, obs)
                     publish_metrics(uid, obs)
@@ -573,7 +569,7 @@ def orchestrate(query, uid, sid, push):
         elif tool == "search_documents":
             search_query = step.get("query", query)
             search_queries.append(search_query)
-            push({"type": "status", "message": f"Searching: {search_query[:50]}..."})
+            push({"type": "status", "message": "Searching: " + search_query[:50] + "..."})
             t_kb = time.time()
             chunks, sources = tool_search_documents(search_query)
             obs["kb_latency_ms"] += int((time.time() - t_kb) * 1000)
@@ -588,7 +584,7 @@ def orchestrate(query, uid, sid, push):
             for src in sources:
                 if src not in all_sources: all_sources.append(src)
             push({"type": "scratchpad", "event": "result",
-                  "content": f"  Found {len(chunks)} chunks from: {', '.join(sources) if sources else 'no matches'}"})
+                  "content": "  Found " + str(len(chunks)) + " chunks from: " + (", ".join(sources) if sources else "no matches")})
 
         elif tool == "answer_question":
             push({"type": "status", "message": "Preparing answer..."})
@@ -605,10 +601,10 @@ def orchestrate(query, uid, sid, push):
                 full_reply += msg
             else:
                 count = len(links)
-                intro = f"\n\nHere {'is' if count==1 else 'are'} the secure download link{'s' if count>1 else ''} (valid 24h):"
+                intro = "\n\nHere " + ("is" if count == 1 else "are") + " the secure download link" + ("s" if count > 1 else "") + " (valid 24h):"
                 push({"type": "token", "content": intro})
                 full_reply += intro
-                scored_sources = [f"{s} ({score_map.get(s,0):.2f})" if score_map.get(s) else s for s in all_sources]
+                scored_sources = [(s + " (" + str(round(score_map.get(s, 0), 2)) + ")") if score_map.get(s) else s for s in all_sources]
                 obs["latency_ms"]  = int((time.time() - t_start) * 1000)
                 obs["answer_len"]  = len(full_reply)
                 write_observation(uid, sid, obs)
@@ -638,7 +634,7 @@ def orchestrate(query, uid, sid, push):
     write_observation(uid, sid, obs)
     publish_metrics(uid, obs)
 
-    scored_sources = [f"{s} ({score_map.get(s,0):.2f})" if score_map.get(s) else s for s in all_sources]
+    scored_sources = [(s + " (" + str(round(score_map.get(s, 0), 2)) + ")") if score_map.get(s) else s for s in all_sources]
     push({"type": "scratchpad", "event": "done", "content": ""})
     push({"type": "final", "sources": scored_sources, "session_id": sid})
     save_turn(uid, sid, query, full_reply or "[Document list shown]", sources=all_sources)
@@ -661,14 +657,14 @@ def lambda_handler(event, context):
     sid   = body.get("session_id", str(uuid.uuid4()))
     uid   = body.get("user_id", "unknown")
 
-    apigw = boto3.client("apigatewaymanagementapi", endpoint_url=f"https://{domain}/{stage}")
+    apigw = boto3.client("apigatewaymanagementapi", endpoint_url="https://" + domain + "/" + stage)
 
     def push(data):
         try:
             payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
             apigw.post_to_connection(ConnectionId=cid, Data=payload)
         except Exception as e:
-            print(f"Push FAILED type={data.get('type','?')} err={e}")
+            print("Push FAILED type=" + str(data.get("type","?")) + " err=" + str(e))
 
     if not query or query.lower() in ("hi","hello","hey","start"):
         for i in range(0, len(WELCOME), 8):
@@ -679,9 +675,8 @@ def lambda_handler(event, context):
     try:
         orchestrate(query, uid, sid, push)
     except Exception as e:
-        print(f"Orchestrator error: {e}")
+        print("Orchestrator error: " + str(e))
         push({"type": "error", "message": "Something went wrong. Please try again."})
-        # Write error observation
         write_observation(uid, sid, {"status": "error", "error": str(e), "tools_called": []})
         publish_metrics(uid, {"status": "error", "input_tokens": 0, "output_tokens": 0, "latency_ms": 0})
 
