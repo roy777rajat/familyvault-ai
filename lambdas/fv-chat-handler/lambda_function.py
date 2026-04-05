@@ -1,7 +1,8 @@
 """FamilyVault AI — Chat Handler v14
 Fixes:
-  - download_document now works when planner skips KB search and goes direct
-    (uses step query to match DDB filenames when all_sources is empty)
+  - download_document: 4-tier matching priority — exact filename first,
+    then high-score KB source, then substring, then keyword fallback.
+    Prevents multiple docs returning when user names a specific file.
   - Observability: DDB + CloudWatch metrics per turn
   - No backslash in f-strings (Python 3.11 compatible)
 """
@@ -265,8 +266,8 @@ Available tools:
 
 RULES:
 - Return ONLY valid JSON array. No markdown, no explanation.
-- Each step: {"tool": "<n>", "query": "<filename or search string>", "reason": "<why>"}
-- For download_document, always set "query" to the exact filename if known from context.
+- Each step: {"tool": "<name>", "query": "<exact filename or search string>", "reason": "<why>"}
+- For download_document: set "query" to the EXACT filename if known from context (e.g. "Aishiki-aakash-first-payment-03042026.pdf").
 - Include download_document ONLY if user EXPLICITLY asked for link/download/url.
 - Maximum 4 steps.
 
@@ -280,8 +281,8 @@ Plan: [{"tool":"document_list","reason":"Show inventory"}]
 User: "Share PAN card details and download link"
 Plan: [{"tool":"search_documents","query":"PAN card","reason":"Find PAN"},{"tool":"answer_question","reason":"Share details"},{"tool":"download_document","reason":"User asked for link"}]
 
-User: "Give me download link for Aishiki payment" (with prior context showing Aishiki-aakash-first-payment-03042026.pdf)
-Plan: [{"tool":"download_document","query":"Aishiki-aakash-first-payment-03042026.pdf","reason":"User wants download link"}]
+User: "Give me download for Aishiki-aakash-first-payment-03042026.pdf"
+Plan: [{"tool":"download_document","query":"Aishiki-aakash-first-payment-03042026.pdf","reason":"Exact filename provided"}]
 
 User: "What is the weather today?"
 Plan: [{"tool":"out_of_scope"}]"""
@@ -366,86 +367,109 @@ def tool_document_list(uid, filter_query=None):
 
 # ==============================================================
 #  TOOL: download_document
-#  KEY FIX: when all_sources is empty but step has a query (planner
-#  identified filename from memory), match the query directly against
-#  DDB filenames instead of failing immediately.
+#
+#  4-TIER MATCHING PRIORITY (stops on first tier that yields results):
+#
+#  Tier 1 — EXACT filename match
+#    Any query that looks like a filename (contains ".") is compared
+#    exactly (case-insensitive) against every DDB doc filename.
+#    If a match is found, return immediately — do NOT fall through.
+#
+#  Tier 2 — HIGH-SCORE KB source exact match
+#    If KB search ran and returned grounded_sources, match those
+#    sources exactly against DDB filenames.
+#    Return immediately on first match.
+#
+#  Tier 3 — SUBSTRING match on all candidate strings
+#    Candidate strings = grounded_sources + all_queries.
+#    A DDB filename matches if it contains (or is contained by)
+#    any candidate string. Shorter candidate strings are more
+#    discriminating so we prefer longer matches.
+#
+#  Tier 4 — KEYWORD fallback (only if nothing found above)
+#    Split all queries into keywords. A DDB filename must match
+#    at least 3 unique keywords to qualify (high bar to avoid
+#    broad matches like "aishiki" matching all 3 aishiki docs).
 # ==============================================================
 
 def tool_download_document(all_docs, grounded_sources, search_queries=None):
-    """
-    Match docs and generate presigned links.
-    grounded_sources: filenames from KB search (may be empty if planner went direct)
-    search_queries: query strings used by planner (used as fallback when sources empty)
-    """
-    # Build keyword set from all available queries
-    stops = {"the","for","and","of","a","an","in","on","at","to","with","details","number",
-             "what","is","my","their","from","about","show","find","get","tell","please","can","you"}
-    query_keywords = set()
-    all_queries = list(search_queries or [])
-    if search_queries:
-        for q in search_queries:
-            for w in re.split(r'\W+', q.lower()):
-                if len(w) > 2 and w not in stops:
-                    query_keywords.add(w)
+    all_queries = [q.strip() for q in (search_queries or []) if q and q.strip()]
+    all_candidates = list(grounded_sources or []) + all_queries
 
-    # --- PRIMARY PATH: match via KB-grounded sources ---
+    print("Download: sources=" + str(grounded_sources) + " queries=" + str(all_queries))
+
+    # ── TIER 1: exact filename match ──────────────────────────────────────
+    # Any candidate that looks like a filename (has an extension dot)
+    filename_candidates = [c for c in all_candidates if re.search(r'\.\w{2,5}$', c)]
+    if filename_candidates:
+        for doc in all_docs:
+            fname = (doc.get("filename") or "").strip()
+            for fc in filename_candidates:
+                if fname.lower() == fc.lower():
+                    print("Tier 1 exact match: " + fname)
+                    url = make_presigned(doc.get("s3_key",""), fname)
+                    if url:
+                        return [{"filename": fname, "url": url}]
+
+    # ── TIER 2: KB grounded source exact match ────────────────────────────
     if grounded_sources:
-        scored_sources = []
         for src in grounded_sources:
-            src_lower = src.lower()
-            if query_keywords:
-                kw_matches = sum(1 for kw in query_keywords if kw in src_lower)
-                if kw_matches > 0:
-                    scored_sources.append((kw_matches, src))
-            else:
-                scored_sources.append((0, src))
-                break
-        if not scored_sources:
-            scored_sources = [(0, grounded_sources[0])]
-        scored_sources.sort(key=lambda x: -x[0])
-        target_sources = [s for _, s in scored_sources]
-        print("Download via KB sources: " + str(target_sources))
+            for doc in all_docs:
+                fname = (doc.get("filename") or "").strip()
+                if fname.lower() == src.lower():
+                    print("Tier 2 KB exact match: " + fname)
+                    url = make_presigned(doc.get("s3_key",""), fname)
+                    if url:
+                        return [{"filename": fname, "url": url}]
 
-    # --- FALLBACK PATH: no KB sources — match query keywords directly against DDB filenames ---
-    else:
-        if not query_keywords and not all_queries:
-            print("Download: no sources and no query — cannot match")
-            return []
-        # Use full query strings as potential filename matches too
-        target_sources = list(all_queries)
-        print("Download via direct query match: " + str(target_sources) + " keywords=" + str(query_keywords))
-
-    # Match target_sources against DDB filenames
-    matched = []
+    # ── TIER 3: substring match ───────────────────────────────────────────
+    # Sort candidates longest-first so more specific strings win
+    sorted_candidates = sorted(all_candidates, key=len, reverse=True)
+    tier3_matched = []
     for doc in all_docs:
         fname = (doc.get("filename") or "").lower().strip()
-        if not fname:
-            continue
-        for src in target_sources:
-            src_lower = src.lower().strip()
-            # Exact or substring match on filename
-            if fname == src_lower or fname in src_lower or src_lower in fname:
-                if doc not in matched:
-                    matched.append(doc)
+        if not fname: continue
+        for cand in sorted_candidates:
+            cand_lower = cand.lower().strip()
+            if not cand_lower: continue
+            if fname == cand_lower or cand_lower in fname or fname in cand_lower:
+                if doc not in tier3_matched:
+                    tier3_matched.append(doc)
                 break
-        else:
-            # Keyword fallback: if enough keywords match the filename
-            if query_keywords:
-                kw_hits = sum(1 for kw in query_keywords if kw in fname)
-                if kw_hits >= 2 and doc not in matched:
-                    matched.append(doc)
+    if tier3_matched:
+        print("Tier 3 substring match: " + str([d.get("filename") for d in tier3_matched]))
+        links = []
+        for doc in tier3_matched[:5]:
+            url = make_presigned(doc.get("s3_key",""), doc.get("filename","document"))
+            if url: links.append({"filename": doc.get("filename","document"), "url": url})
+        if links: return links
 
-    print("Download matched docs: " + str([d.get("filename") for d in matched]))
+    # ── TIER 4: keyword fallback (high bar — need 3+ keyword hits) ────────
+    stops = {"the","for","and","of","a","an","in","on","at","to","with","details","number",
+             "what","is","my","their","from","about","show","find","get","tell","please","can","you",
+             "download","link","give","me","pdf","doc","file","document","share"}
+    kws = set()
+    for q in all_queries:
+        for w in re.split(r'[\W_]+', q.lower()):
+            if len(w) > 2 and w not in stops:
+                kws.add(w)
+    if kws:
+        tier4_matched = []
+        for doc in all_docs:
+            fname = (doc.get("filename") or "").lower().strip()
+            hits = sum(1 for kw in kws if kw in fname)
+            if hits >= 3 and doc not in tier4_matched:
+                tier4_matched.append(doc)
+        if tier4_matched:
+            print("Tier 4 keyword match (" + str(len(kws)) + " kws, need 3): " + str([d.get("filename") for d in tier4_matched]))
+            links = []
+            for doc in tier4_matched[:5]:
+                url = make_presigned(doc.get("s3_key",""), doc.get("filename","document"))
+                if url: links.append({"filename": doc.get("filename","document"), "url": url})
+            if links: return links
 
-    links = []
-    for doc in matched[:5]:
-        s3_key = doc.get("s3_key", "")
-        fname  = doc.get("filename", "document")
-        if s3_key:
-            url = make_presigned(s3_key, fname)
-            if url:
-                links.append({"filename": fname, "url": url})
-    return links
+    print("Download: no match found")
+    return []
 
 # ==============================================================
 #  TOOL: answer_question
@@ -623,7 +647,7 @@ def orchestrate(query, uid, sid, push):
         elif tool == "download_document":
             if not all_docs: all_docs = get_user_docs(uid)
 
-            # Collect all possible query hints: KB sources + step query + prior search queries
+            # Pass step query + prior search queries as effective_queries
             step_query = step.get("query", "")
             effective_queries = list(search_queries)
             if step_query and step_query not in effective_queries:
