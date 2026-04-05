@@ -1,12 +1,9 @@
 """FamilyVault AI — Chat Handler v14
-What changed from v13:
-  - OBSERVABILITY: Every chat turn writes a structured record to ChatObservability DynamoDB table
-  - Tracks: input_tokens, output_tokens, latency_ms, kb_chunks_retrieved, tools_called,
-    tool_latency_ms, model_id, session_id, user_id, status, estimated_cost_usd
-  - Publishes CloudWatch custom metrics: ChatLatencyMs, InputTokens, OutputTokens,
-    KBChunksRetrieved, ChatErrors, TotalTokens (namespace: FamilyVault/Chat)
-  - Estimated cost: input $0.80/MTok, output $4.00/MTok (Claude Haiku 4.5 pricing)
-  - Fix: removed backslash inside f-string (Python 3.11 incompatible)
+Fixes:
+  - download_document now works when planner skips KB search and goes direct
+    (uses step query to match DDB filenames when all_sources is empty)
+  - Observability: DDB + CloudWatch metrics per turn
+  - No backslash in f-strings (Python 3.11 compatible)
 """
 import json, boto3, os, uuid, re, time
 from datetime import datetime, timezone
@@ -48,9 +45,7 @@ def write_observation(uid, sid, obs):
         record = {
             "PK": "USER#" + uid,
             "SK": "OBS#" + ts + "#" + str(uuid.uuid4())[:8],
-            "user_id": uid,
-            "session_id": sid,
-            "ts": ts,
+            "user_id": uid, "session_id": sid, "ts": ts,
             "input_tokens":        int(obs.get("input_tokens", 0)),
             "output_tokens":       int(obs.get("output_tokens", 0)),
             "total_tokens":        int(obs.get("input_tokens", 0)) + int(obs.get("output_tokens", 0)),
@@ -63,9 +58,7 @@ def write_observation(uid, sid, obs):
             "model_id":            obs.get("model_id", ANSWERER_MODEL),
             "status":              obs.get("status", "ok"),
             "error":               obs.get("error", ""),
-            "estimated_cost_usd":  str(estimate_cost(
-                                       obs.get("input_tokens", 0),
-                                       obs.get("output_tokens", 0))),
+            "estimated_cost_usd":  str(estimate_cost(obs.get("input_tokens", 0), obs.get("output_tokens", 0))),
             "query_len":           int(obs.get("query_len", 0)),
             "answer_len":          int(obs.get("answer_len", 0)),
             "short_term_turns":    int(obs.get("short_term_turns", 0)),
@@ -116,8 +109,7 @@ def load_short_term_memory(uid, sid, limit=6):
         for item in items:
             q = (item.get("question") or "").strip()
             a = (item.get("answer") or "").strip()
-            if q:
-                messages.append({"role": "user",      "content": q})
+            if q: messages.append({"role": "user", "content": q})
             if a and not a.startswith("[Document list"):
                 messages.append({"role": "assistant", "content": a})
         print("Short-term memory: " + str(len(items)) + " turns for session " + sid)
@@ -137,11 +129,9 @@ def load_long_term_memory(uid, current_sid, max_sessions=3):
         sessions = {}
         for item in items:
             s = item.get("session_id", "")
-            if not s or s == current_sid:
-                continue
+            if not s or s == current_sid: continue
             sessions.setdefault(s, []).append(item)
-        if not sessions:
-            return ""
+        if not sessions: return ""
         def session_ts(items_list):
             return max((i.get("created_at", "") for i in items_list), default="")
         sorted_sessions = sorted(sessions.items(), key=lambda kv: session_ts(kv[1]), reverse=True)[:max_sessions]
@@ -164,8 +154,7 @@ def load_long_term_memory(uid, current_sid, max_sessions=3):
                     lines.append("A: " + a_short)
                     if sources:
                         lines.append("   (Sources: " + ", ".join(sources[:3]) + ")")
-        if len(lines) <= 1:
-            return ""
+        if len(lines) <= 1: return ""
         print("Long-term memory: " + str(len(sorted_sessions)) + " past sessions")
         return "\n".join(lines)
     except Exception as e:
@@ -251,10 +240,8 @@ def save_turn(uid, sid, question, answer, sources=None):
         dynamodb.Table("ChatSessions").put_item(Item={
             "PK": "USER#" + uid,
             "SK": "SESSION#" + sid + "#TURN#" + str(uuid.uuid4()),
-            "session_id": sid,
-            "question": question,
-            "answer": answer[:800],
-            "sources": sources or [],
+            "session_id": sid, "question": question,
+            "answer": answer[:800], "sources": sources or [],
             "created_at": datetime.now(timezone.utc).isoformat(),
             "deleted": False
         })
@@ -278,7 +265,8 @@ Available tools:
 
 RULES:
 - Return ONLY valid JSON array. No markdown, no explanation.
-- Each step: {"tool": "<n>", "query": "<search string>", "reason": "<why>"}
+- Each step: {"tool": "<n>", "query": "<filename or search string>", "reason": "<why>"}
+- For download_document, always set "query" to the exact filename if known from context.
 - Include download_document ONLY if user EXPLICITLY asked for link/download/url.
 - Maximum 4 steps.
 
@@ -291,6 +279,9 @@ Plan: [{"tool":"document_list","reason":"Show inventory"}]
 
 User: "Share PAN card details and download link"
 Plan: [{"tool":"search_documents","query":"PAN card","reason":"Find PAN"},{"tool":"answer_question","reason":"Share details"},{"tool":"download_document","reason":"User asked for link"}]
+
+User: "Give me download link for Aishiki payment" (with prior context showing Aishiki-aakash-first-payment-03042026.pdf)
+Plan: [{"tool":"download_document","query":"Aishiki-aakash-first-payment-03042026.pdf","reason":"User wants download link"}]
 
 User: "What is the weather today?"
 Plan: [{"tool":"out_of_scope"}]"""
@@ -375,42 +366,85 @@ def tool_document_list(uid, filter_query=None):
 
 # ==============================================================
 #  TOOL: download_document
+#  KEY FIX: when all_sources is empty but step has a query (planner
+#  identified filename from memory), match the query directly against
+#  DDB filenames instead of failing immediately.
 # ==============================================================
 
 def tool_download_document(all_docs, grounded_sources, search_queries=None):
-    if not grounded_sources: return []
+    """
+    Match docs and generate presigned links.
+    grounded_sources: filenames from KB search (may be empty if planner went direct)
+    search_queries: query strings used by planner (used as fallback when sources empty)
+    """
+    # Build keyword set from all available queries
+    stops = {"the","for","and","of","a","an","in","on","at","to","with","details","number",
+             "what","is","my","their","from","about","show","find","get","tell","please","can","you"}
     query_keywords = set()
+    all_queries = list(search_queries or [])
     if search_queries:
-        stops = {"the","for","and","of","a","an","in","on","at","to","with","details","number",
-                 "what","is","my","their","from","about","show","find","get","tell","please","can","you"}
         for q in search_queries:
             for w in re.split(r'\W+', q.lower()):
-                if len(w) > 2 and w not in stops: query_keywords.add(w)
-    scored_sources = []
-    for src in grounded_sources:
-        src_lower = src.lower()
-        if query_keywords:
-            kw_matches = sum(1 for kw in query_keywords if kw in src_lower)
-            if kw_matches > 0: scored_sources.append((kw_matches, src))
-        else:
-            scored_sources.append((0, src)); break
-    if not scored_sources and grounded_sources:
-        scored_sources = [(0, grounded_sources[0])]
-    scored_sources.sort(key=lambda x: -x[0])
-    target_sources = [s for _, s in scored_sources]
+                if len(w) > 2 and w not in stops:
+                    query_keywords.add(w)
+
+    # --- PRIMARY PATH: match via KB-grounded sources ---
+    if grounded_sources:
+        scored_sources = []
+        for src in grounded_sources:
+            src_lower = src.lower()
+            if query_keywords:
+                kw_matches = sum(1 for kw in query_keywords if kw in src_lower)
+                if kw_matches > 0:
+                    scored_sources.append((kw_matches, src))
+            else:
+                scored_sources.append((0, src))
+                break
+        if not scored_sources:
+            scored_sources = [(0, grounded_sources[0])]
+        scored_sources.sort(key=lambda x: -x[0])
+        target_sources = [s for _, s in scored_sources]
+        print("Download via KB sources: " + str(target_sources))
+
+    # --- FALLBACK PATH: no KB sources — match query keywords directly against DDB filenames ---
+    else:
+        if not query_keywords and not all_queries:
+            print("Download: no sources and no query — cannot match")
+            return []
+        # Use full query strings as potential filename matches too
+        target_sources = list(all_queries)
+        print("Download via direct query match: " + str(target_sources) + " keywords=" + str(query_keywords))
+
+    # Match target_sources against DDB filenames
     matched = []
     for doc in all_docs:
         fname = (doc.get("filename") or "").lower().strip()
+        if not fname:
+            continue
         for src in target_sources:
-            if fname == src.lower() or fname in src.lower() or src.lower() in fname:
-                if doc not in matched: matched.append(doc); break
+            src_lower = src.lower().strip()
+            # Exact or substring match on filename
+            if fname == src_lower or fname in src_lower or src_lower in fname:
+                if doc not in matched:
+                    matched.append(doc)
+                break
+        else:
+            # Keyword fallback: if enough keywords match the filename
+            if query_keywords:
+                kw_hits = sum(1 for kw in query_keywords if kw in fname)
+                if kw_hits >= 2 and doc not in matched:
+                    matched.append(doc)
+
+    print("Download matched docs: " + str([d.get("filename") for d in matched]))
+
     links = []
     for doc in matched[:5]:
         s3_key = doc.get("s3_key", "")
         fname  = doc.get("filename", "document")
         if s3_key:
             url = make_presigned(s3_key, fname)
-            if url: links.append({"filename": fname, "url": url})
+            if url:
+                links.append({"filename": fname, "url": url})
     return links
 
 # ==============================================================
@@ -435,8 +469,7 @@ def tool_answer_question(query, all_chunks, push_fn, short_term_history, long_te
 
     system = ("You are FamilyVault AI \u2014 a warm, professional personal document assistant.\n"
               + long_term_block
-              + "\nRETRIEVED DOCUMENT CONTENT:\n"
-              + rag_context
+              + "\nRETRIEVED DOCUMENT CONTENT:\n" + rag_context
               + "\n\nSTRICT RULES:\n"
               "1. Answer ONLY from retrieved document content. Never invent facts.\n"
               "2. Be specific \u2014 quote exact values when found.\n"
@@ -518,16 +551,13 @@ def orchestrate(query, uid, sid, push):
     obs["planner_latency_ms"] = int((time.time() - t_plan) * 1000)
     obs["tools_called"] = [s.get("tool") for s in steps]
 
-    # Build plan summary without backslash in f-string
     plan_lines = []
     for i, s in enumerate(steps, 1):
         line = "  " + str(i) + ". " + str(s.get("tool", "?"))
         q = s.get("query")
-        if q:
-            line += " query=" + q
+        if q: line += " query=" + q
         plan_lines.append(line)
-    push({"type": "scratchpad", "event": "plan",
-          "content": "Plan:\n" + "\n".join(plan_lines)})
+    push({"type": "scratchpad", "event": "plan", "content": "Plan:\n" + "\n".join(plan_lines)})
 
     all_chunks, all_sources, score_map = [], [], {}
     all_docs, full_reply, search_queries = None, "", []
@@ -559,7 +589,7 @@ def orchestrate(query, uid, sid, push):
                 if not any(s["tool"] in ("search_documents","answer_question","download_document") for s in steps):
                     push({"type": "scratchpad", "event": "done", "content": ""})
                     push({"type": "final", "sources": [], "session_id": sid})
-                    save_turn(uid, sid, query, "[Document list: " + str(len(list_docs)) + " docs filter='" + filter_q + "']")
+                    save_turn(uid, sid, query, "[Document list: " + str(len(list_docs)) + " docs]")
                     obs["latency_ms"] = int((time.time() - t_start) * 1000)
                     write_observation(uid, sid, obs)
                     publish_metrics(uid, obs)
@@ -588,13 +618,18 @@ def orchestrate(query, uid, sid, push):
 
         elif tool == "answer_question":
             push({"type": "status", "message": "Preparing answer..."})
-            full_reply += tool_answer_question(
-                query, all_chunks, push, short_term, long_term, obs
-            )
+            full_reply += tool_answer_question(query, all_chunks, push, short_term, long_term, obs)
 
         elif tool == "download_document":
             if not all_docs: all_docs = get_user_docs(uid)
-            links = tool_download_document(all_docs, all_sources, search_queries)
+
+            # Collect all possible query hints: KB sources + step query + prior search queries
+            step_query = step.get("query", "")
+            effective_queries = list(search_queries)
+            if step_query and step_query not in effective_queries:
+                effective_queries.append(step_query)
+
+            links = tool_download_document(all_docs, all_sources, effective_queries)
             if not links:
                 msg = "\n\nRegarding download links: I wasn't able to identify the specific document. Could you mention the name or type?"
                 push({"type": "token", "content": msg})
@@ -618,7 +653,7 @@ def orchestrate(query, uid, sid, push):
         elif tool == "out_of_scope":
             reply = ("That is a bit outside what I can help with. "
                      "I am best at answering questions about your stored documents, "
-                     "listing files, or sharing download links. Is there something document-related I can help with?")
+                     "listing files, or sharing download links.")
             push({"type": "token", "content": reply})
             obs["latency_ms"] = int((time.time() - t_start) * 1000)
             obs["answer_len"] = len(reply)
@@ -628,12 +663,10 @@ def orchestrate(query, uid, sid, push):
             save_turn(uid, sid, query, reply)
             return
 
-    # Finish
     obs["latency_ms"] = int((time.time() - t_start) * 1000)
     obs["answer_len"] = len(full_reply)
     write_observation(uid, sid, obs)
     publish_metrics(uid, obs)
-
     scored_sources = [(s + " (" + str(round(score_map.get(s, 0), 2)) + ")") if score_map.get(s) else s for s in all_sources]
     push({"type": "scratchpad", "event": "done", "content": ""})
     push({"type": "final", "sources": scored_sources, "session_id": sid})
