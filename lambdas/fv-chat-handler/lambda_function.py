@@ -1,18 +1,20 @@
-"""FamilyVault AI — Chat Handler v15.2
+"""FamilyVault AI — Chat Handler v15.3
 
-Fixes vs v15.1:
-  BUG 1 — run_list_documents(): extends the keyword search string to include
-           doc_category(filename).lower(), so queries like "Academic" now match.
-  BUG 2 — DECOMPOSER_SYSTEM_PROMPT: injects a CRITICAL rule that prevents the
-           decomposer from emitting exact_download/semantic_download intent unless
-           the user actually said download/link/url/share/attach.
-  BUG 3 — run_content_question(): strips **...** and leading - /* from every
-           streamed token before yielding it to the WebSocket client.
-  BUG 4 — run_content_question(): also strips markdown from the full accumulator
-           before save_turn() writes it to DDB, breaking the LTM feedback loop
-           that was re-training the model toward markdown output.
-  IAM   — lambda:InvokeFunction on fv-email-sender ARN already present on
-           FamilyVaultLambdaRole (confirmed — no change needed).
+Fixes vs v15.2:
+  BUG-A — Frontend link bleed: push {"type":"clear_links"} at the very start of
+           every orchestrate() call so the UI wipes its download-card state before
+           rendering the new turn. Previously, old links from prior turns kept
+           re-appearing because the frontend never received a clear signal.
+
+  BUG-B — Decomposer still classifying "do you have X?", "tell me about X",
+           "have you know X" as download intents. Extended the CRITICAL guard
+           with additional trigger phrases and added explicit counter-examples.
+
+  BUG-D — list_documents filter matched user names (Rajat, Roy) that appear in
+           many filenames, returning every document. Added personal-name tokens
+           to the stop-word list so they are excluded from keyword matching.
+
+Fixes from v15.2 (BUG 1-4, IAM) all retained unchanged.
 """
 import json, boto3, os, uuid, re, time
 from datetime import datetime, timezone
@@ -22,7 +24,7 @@ dynamodb  = boto3.resource("dynamodb", region_name="eu-west-1")
 bedrock   = boto3.client("bedrock-runtime", region_name="eu-west-1")
 s3        = boto3.client("s3", region_name="eu-west-1")
 cw        = boto3.client("cloudwatch", region_name="eu-west-1")
-lmb       = boto3.client("lambda", region_name="eu-west-1")   # for direct Lambda invoke
+lmb       = boto3.client("lambda", region_name="eu-west-1")
 
 KB_ID            = os.environ.get("BEDROCK_KB_ID", "PYV06IINGT")
 BUCKET           = os.environ.get("BUCKET", "family-docs-raw")
@@ -102,7 +104,6 @@ def publish_metrics(uid, obs):
 # ================================================================
 
 def load_short_term_memory(uid, sid, limit=6):
-    """Load real Q&A turns only — skip internal bracket replies."""
     try:
         table = dynamodb.Table("ChatSessions")
         result = table.scan(
@@ -116,12 +117,11 @@ def load_short_term_memory(uid, sid, limit=6):
             q = (item.get("question") or "").strip()
             a = (item.get("answer") or "").strip()
             if not q: continue
-            # Skip internal bracket-only answers (e.g. "[send_email CP1...]", "[tasks completed]")
             is_internal = a.startswith("[") and a.endswith("]")
             if q: messages.append({"role": "user", "content": q})
             if a and not is_internal:
                 messages.append({"role": "assistant", "content": a})
-        print("STM: " + str(len(items)) + " turns (real Q&A only)")
+        print("STM: " + str(len(items)) + " turns")
         return messages
     except Exception as e:
         print("STM error: " + str(e))
@@ -152,8 +152,7 @@ def load_long_term_memory(uid, current_sid, max_sessions=3):
                 a = (item.get("answer") or "").strip()
                 is_internal = a.startswith("[") and a.endswith("]")
                 if q and a and not is_internal:
-                    # BUG 4 FIX: strip bold markers and bullet prefixes from LTM answers
-                    # so the model is not re-trained toward markdown output via context.
+                    # BUG 4: strip markdown before injecting into LTM context
                     a_clean = re.sub(r'\*\*(.+?)\*\*', r'\1', a)
                     a_clean = re.sub(r'(?m)^[\-\*]\s+', '', a_clean).strip()
                     lines.append("Q: " + q)
@@ -294,17 +293,12 @@ def is_confirm(text):
     return any(w in t for w in ["yes","send","confirm","delete","ok","sure","proceed","go ahead","do it","yep","yeah"])
 
 # ================================================================
-#  MARKDOWN STRIPPER  (BUG 3 & 4)
+#  MARKDOWN STRIPPER
 # ================================================================
 
 def strip_markdown(text):
-    """Remove **bold** markers and leading bullet/dash prefixes from text.
-    Used both on streamed tokens (BUG 3) and on the full reply before save_turn (BUG 4).
-    """
-    # Strip **bold** and *italic* markers
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'\*(.+?)\*', r'\1', text)
-    # Strip leading bullet/dash prefixes at start of lines
     text = re.sub(r'(?m)^[\-\*]\s+', '', text)
     return text
 
@@ -372,20 +366,14 @@ def fuzzy_doc_match(all_docs, query, require_hits=2):
     return matched
 
 # ================================================================
-#  EMAIL LAMBDA — direct boto3 invoke (no HTTP, no JWT needed)
+#  EMAIL LAMBDA
 # ================================================================
 
 def invoke_email_lambda(path_suffix, payload_dict, uid):
-    """
-    Call fv-email-sender directly via boto3 Lambda.invoke.
-    Simulates an HTTP POST to /email/<path_suffix> without going through API Gateway.
-    The email sender reads uid from headers['x-user-id'] (v5 fallback).
-    """
-    # Construct a minimal API Gateway-style event
     event = {
         "requestContext": {
             "http": {"method": "POST"},
-            "authorizer": {"jwt": {"claims": {}}}   # empty JWT — sender falls back to header
+            "authorizer": {"jwt": {"claims": {}}}
         },
         "rawPath": "/email/" + path_suffix,
         "headers": {"x-user-id": uid, "content-type": "application/json"},
@@ -399,7 +387,6 @@ def invoke_email_lambda(path_suffix, payload_dict, uid):
         )
         result_str = resp["Payload"].read().decode()
         result = json.loads(result_str)
-        # API Gateway wraps body as string
         if isinstance(result.get("body"), str):
             result["body"] = json.loads(result["body"])
         print("Lambda invoke /email/" + path_suffix + " status=" + str(result.get("statusCode")))
@@ -419,8 +406,8 @@ of independent sub-tasks for THAT message only. Do NOT re-create tasks for previ
 Use history only to resolve references like "that file" or "the same document".
 
 INTENT TYPES:
-- exact_download    : user provides an exact filename
-- semantic_download : user describes a doc by concept (e.g. "my PAN card")
+- exact_download    : user provides an exact filename AND asks to download/get the file
+- semantic_download : user describes a doc by concept AND asks to download/get the file
 - content_question  : user asks a question answered by document content
 - list_documents    : user wants to see their document inventory
 - send_email        : user wants to email documents to someone
@@ -440,11 +427,13 @@ RULES:
 
 CRITICAL — DOWNLOAD INTENT GUARD:
   NEVER emit exact_download or semantic_download unless the user's message
-  explicitly contains at least one of these keywords (case-insensitive):
-  download, link, url, share, attach, get me the file, give me the file.
-  If the user is asking a QUESTION about a document (e.g. "what is my PAN number?",
-  "what does my offer letter say?") use content_question instead.
-  A document name or category alone does NOT trigger a download intent.
+  explicitly contains at least one of these trigger words/phrases (case-insensitive):
+    download, link, url, share, attach, get me the file, give me the file, send me the file
+
+  The following phrases mean the user wants INFORMATION about a document, NOT a file:
+    "do you have", "have you", "know about", "tell me about", "what is", "what are",
+    "can you tell", "is there", "please share the details", "details about"
+  These must ALWAYS map to content_question or list_documents — NEVER to a download intent.
 
 EXAMPLES:
 
@@ -464,8 +453,20 @@ User: "what is my PAN number?"
 User: "what does my offer letter say about my salary?"
 [{"intent_type":"content_question","target":"offer letter salary","params":{"query":"offer letter salary details"}}]
 
+User: "do you have sem-1.pdf?"
+[{"intent_type":"content_question","target":"Sem-1 document","params":{"query":"Sem-1 first semester academic results"}}]
+
+User: "have you know Poushali doctor prescription reg Aishiki Roy?"
+[{"intent_type":"content_question","target":"Poushali prescription Aishiki","params":{"query":"Poushali doctor prescription Aishiki Roy"}}]
+
+User: "tell me about Rajat experience in Cloud Technology?"
+[{"intent_type":"content_question","target":"Rajat cloud experience","params":{"query":"Rajat Roy cloud technology experience"}}]
+
 User: "show me my Academic documents"
 [{"intent_type":"list_documents","target":"Academic documents","params":{"query":"Academic"}}]
+
+User: "please share the list of documents you have regarding semester exam of Rajat Roy"
+[{"intent_type":"list_documents","target":"semester exam documents","params":{"query":"semester"}}]
 
 User: "what is the weather?"
 [{"intent_type":"out_of_scope","target":"weather","params":{}}]"""
@@ -568,7 +569,7 @@ def run_content_question(task, push, short_term, long_term, obs):
             if ch.get("type") == "content_block_delta":
                 tok = ch.get("delta",{}).get("text","")
                 if tok:
-                    # BUG 3 FIX: strip markdown from each token before pushing to client
+                    # BUG 3: strip markdown from each streamed token
                     clean_tok = strip_markdown(tok)
                     full += clean_tok
                     push({"type":"token","content":clean_tok})
@@ -583,19 +584,23 @@ def run_content_question(task, push, short_term, long_term, obs):
     obs["input_tokens"] = obs.get("input_tokens",0) + inp
     obs["output_tokens"] = obs.get("output_tokens",0) + out
     obs["answerer_latency_ms"] = obs.get("answerer_latency_ms",0) + int((time.time()-t1)*1000)
-    # BUG 4 FIX: full is already clean (built from clean_tok above),
-    # so save_turn() will write markdown-free text to DDB, breaking the LTM feedback loop.
+    # BUG 4: full already contains clean text — safe to write to DDB
     return full
 
 def run_list_documents(task, uid, push, obs):
     filter_q = task.get("params", {}).get("query", "").strip()
     all_docs = get_user_docs(uid)
     if filter_q:
-        stops = {"the","a","an","of","in","for","and","or","my","all","show","list","any","some","about"}
+        # BUG-D FIX: expanded stop-list includes common personal names so that
+        # "semester exam of Rajat Roy" doesn't match every file containing "roy".
+        stops = {
+            "the","a","an","of","in","for","and","or","my","all","show","list",
+            "any","some","about","please","share","documents","you","have",
+            "regarding","related","rajat","roy","aishiki","pinaki","prasad",
+        }
         kws = [w for w in re.split(r'\W+', filter_q.lower()) if len(w) > 1 and w not in stops]
         if kws:
-            # BUG 1 FIX: include doc_category(filename).lower() in the search string
-            # so category-name queries like "Academic", "Insurance", "Employment" match correctly.
+            # BUG 1: include doc_category in search string
             all_docs = [d for d in all_docs if any(
                 kw in (
                     (d.get("filename","") or "").lower()
@@ -683,7 +688,6 @@ def resume_send_email_cp2(pending, uid, sid, all_docs, push, obs):
     doc_refs   = pending.get("doc_refs", [])
     tone       = pending.get("tone", "Professional")
     recipients = pending.get("recipients", [])
-    # Resolve doc refs → actual DDB docs
     resolved_docs = []
     for ref in doc_refs:
         doc = exact_doc_match(all_docs, ref)
@@ -699,12 +703,10 @@ def resume_send_email_cp2(pending, uid, sid, all_docs, push, obs):
             resolved_docs.append(doc)
     doc_names = [d.get("filename","") for d in resolved_docs]
     doc_ids   = [d.get("document_id") or d.get("PK","").replace("DOC#","") for d in resolved_docs]
-    # Get KB context
     rag_answer = ""
     for ref in doc_refs[:2]:
         chunks, _ = kb_search(ref)
         if chunks: rag_answer += chunks[0]["text"][:300] + " "
-    # Generate draft via Lambda invoke (not HTTP)
     draft_result = invoke_email_lambda("draft", {
         "rag_answer": rag_answer.strip(),
         "doc_names": doc_names,
@@ -715,7 +717,6 @@ def resume_send_email_cp2(pending, uid, sid, all_docs, push, obs):
     if isinstance(body_data, str): body_data = json.loads(body_data)
     subject = body_data.get("draft_subject", "FamilyVault \u2014 Documents")
     body    = body_data.get("draft_body", "Dear Recipient,\n\nPlease find the requested documents attached.\n\nBest regards,\nFamilyVault AI")
-    # Show preview
     to_str   = ", ".join(recipients)
     docs_str = "\n".join("  - " + n for n in doc_names) if doc_names else "  (no documents resolved — please check doc name)"
     preview  = ("Here is the draft email. Please review:\n\n"
@@ -827,7 +828,7 @@ def resume_delete_document(pending, user_reply, uid, sid, push, obs):
         push({"type":"token","content":"Deletion cancelled. Your documents are safe."})
         return "[delete cancelled]"
     stage = pending.get("stage","")
-    if stage == "selecting":       return _handle_delete_selection(pending, user_reply, uid, sid, push, obs)
+    if stage == "selecting":           return _handle_delete_selection(pending, user_reply, uid, sid, push, obs)
     elif stage == "awaiting_approval": return _handle_delete_approval(pending, user_reply, uid, sid, push, obs)
     return "[delete unknown stage]"
 
@@ -899,13 +900,17 @@ def orchestrate(query, uid, sid, push):
            "tools_called":[],"model_id":ANSWERER_MODEL,"status":"ok","error":"",
            "query_len":len(query),"answer_len":0,"short_term_turns":0,"long_term_sessions":0}
 
+    # BUG-A FIX: tell the frontend to clear any link cards from the previous turn
+    # BEFORE we start sending new content. Without this signal the UI accumulates
+    # download cards across turns because it has no reset boundary.
+    push({"type":"clear_links"})
+
     push({"type":"status","message":"Thinking..."})
     short_term = load_short_term_memory(uid, sid, limit=6)
     long_term  = load_long_term_memory(uid, sid, max_sessions=3)
     obs["short_term_turns"]   = len(short_term) // 2
     obs["long_term_sessions"] = long_term.count("[Session")
 
-    # Check for pending multi-turn task first
     pending = load_pending_task(uid, sid)
     if pending:
         intent = pending.get("intent_type","")
@@ -922,7 +927,6 @@ def orchestrate(query, uid, sid, push):
         save_turn(uid, sid, query, full_reply or "")
         return
 
-    # Fresh decomposition
     t_decomp = time.time()
     tasks = decompose(query, short_term)
     obs["planner_latency_ms"] = int((time.time()-t_decomp)*1000)
