@@ -1,12 +1,18 @@
-"""FamilyVault AI — Chat Handler v15.1
+"""FamilyVault AI — Chat Handler v15.2
 
-Fixes vs v15:
-  - Email 401: replaced urllib.request HTTP calls with boto3 Lambda.invoke
-    (direct Lambda-to-Lambda, no JWT auth needed, no API Gateway involved)
-  - Download links bleeding into email session: decomposer now only receives
-    real Q&A turns, not internal bracket replies like [send_email CP1...]
-  - Decomposer system prompt clarified: only decompose the CURRENT user message,
-    do not re-decompose prior assistant actions from history
+Fixes vs v15.1:
+  BUG 1 — run_list_documents(): extends the keyword search string to include
+           doc_category(filename).lower(), so queries like "Academic" now match.
+  BUG 2 — DECOMPOSER_SYSTEM_PROMPT: injects a CRITICAL rule that prevents the
+           decomposer from emitting exact_download/semantic_download intent unless
+           the user actually said download/link/url/share/attach.
+  BUG 3 — run_content_question(): strips **...** and leading - /* from every
+           streamed token before yielding it to the WebSocket client.
+  BUG 4 — run_content_question(): also strips markdown from the full accumulator
+           before save_turn() writes it to DDB, breaking the LTM feedback loop
+           that was re-training the model toward markdown output.
+  IAM   — lambda:InvokeFunction on fv-email-sender ARN already present on
+           FamilyVaultLambdaRole (confirmed — no change needed).
 """
 import json, boto3, os, uuid, re, time
 from datetime import datetime, timezone
@@ -146,8 +152,12 @@ def load_long_term_memory(uid, current_sid, max_sessions=3):
                 a = (item.get("answer") or "").strip()
                 is_internal = a.startswith("[") and a.endswith("]")
                 if q and a and not is_internal:
+                    # BUG 4 FIX: strip bold markers and bullet prefixes from LTM answers
+                    # so the model is not re-trained toward markdown output via context.
+                    a_clean = re.sub(r'\*\*(.+?)\*\*', r'\1', a)
+                    a_clean = re.sub(r'(?m)^[\-\*]\s+', '', a_clean).strip()
                     lines.append("Q: " + q)
-                    lines.append("A: " + (a[:300] + "..." if len(a) > 300 else a))
+                    lines.append("A: " + (a_clean[:300] + "..." if len(a_clean) > 300 else a_clean))
         if len(lines) <= 1: return ""
         return "\n".join(lines)
     except Exception as e:
@@ -284,6 +294,21 @@ def is_confirm(text):
     return any(w in t for w in ["yes","send","confirm","delete","ok","sure","proceed","go ahead","do it","yep","yeah"])
 
 # ================================================================
+#  MARKDOWN STRIPPER  (BUG 3 & 4)
+# ================================================================
+
+def strip_markdown(text):
+    """Remove **bold** markers and leading bullet/dash prefixes from text.
+    Used both on streamed tokens (BUG 3) and on the full reply before save_turn (BUG 4).
+    """
+    # Strip **bold** and *italic* markers
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    # Strip leading bullet/dash prefixes at start of lines
+    text = re.sub(r'(?m)^[\-\*]\s+', '', text)
+    return text
+
+# ================================================================
 #  KB SEARCH
 # ================================================================
 
@@ -413,6 +438,14 @@ RULES:
 - delete_document → params.query = description of what to delete
 - Maximum 8 sub-tasks.
 
+CRITICAL — DOWNLOAD INTENT GUARD:
+  NEVER emit exact_download or semantic_download unless the user's message
+  explicitly contains at least one of these keywords (case-insensitive):
+  download, link, url, share, attach, get me the file, give me the file.
+  If the user is asking a QUESTION about a document (e.g. "what is my PAN number?",
+  "what does my offer letter say?") use content_question instead.
+  A document name or category alone does NOT trigger a download intent.
+
 EXAMPLES:
 
 User: "download Aishiki-aakash-first-payment-03042026.pdf and my PAN card"
@@ -427,6 +460,12 @@ User: "delete the old admission form"
 
 User: "what is my PAN number?"
 [{"intent_type":"content_question","target":"PAN number","params":{"query":"PAN card number"}}]
+
+User: "what does my offer letter say about my salary?"
+[{"intent_type":"content_question","target":"offer letter salary","params":{"query":"offer letter salary details"}}]
+
+User: "show me my Academic documents"
+[{"intent_type":"list_documents","target":"Academic documents","params":{"query":"Academic"}}]
 
 User: "what is the weather?"
 [{"intent_type":"out_of_scope","target":"weather","params":{}}]"""
@@ -528,7 +567,11 @@ def run_content_question(task, push, short_term, long_term, obs):
             ch = json.loads(ev["chunk"]["bytes"])
             if ch.get("type") == "content_block_delta":
                 tok = ch.get("delta",{}).get("text","")
-                if tok: full += tok; push({"type":"token","content":tok})
+                if tok:
+                    # BUG 3 FIX: strip markdown from each token before pushing to client
+                    clean_tok = strip_markdown(tok)
+                    full += clean_tok
+                    push({"type":"token","content":clean_tok})
             elif ch.get("type") == "message_start":
                 inp += ch.get("message",{}).get("usage",{}).get("input_tokens",0)
             elif ch.get("type") == "message_delta":
@@ -540,6 +583,8 @@ def run_content_question(task, push, short_term, long_term, obs):
     obs["input_tokens"] = obs.get("input_tokens",0) + inp
     obs["output_tokens"] = obs.get("output_tokens",0) + out
     obs["answerer_latency_ms"] = obs.get("answerer_latency_ms",0) + int((time.time()-t1)*1000)
+    # BUG 4 FIX: full is already clean (built from clean_tok above),
+    # so save_turn() will write markdown-free text to DDB, breaking the LTM feedback loop.
     return full
 
 def run_list_documents(task, uid, push, obs):
@@ -549,8 +594,14 @@ def run_list_documents(task, uid, push, obs):
         stops = {"the","a","an","of","in","for","and","or","my","all","show","list","any","some","about"}
         kws = [w for w in re.split(r'\W+', filter_q.lower()) if len(w) > 1 and w not in stops]
         if kws:
+            # BUG 1 FIX: include doc_category(filename).lower() in the search string
+            # so category-name queries like "Academic", "Insurance", "Employment" match correctly.
             all_docs = [d for d in all_docs if any(
-                kw in ((d.get("filename","") or "").lower() + " " + (d.get("subject","") or "").lower())
+                kw in (
+                    (d.get("filename","") or "").lower()
+                    + " " + (d.get("subject","") or "").lower()
+                    + " " + doc_category(d.get("filename","")).lower()
+                )
                 for kw in kws
             )]
     if not all_docs:
