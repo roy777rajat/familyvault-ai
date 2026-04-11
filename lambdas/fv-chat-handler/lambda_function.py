@@ -1,20 +1,19 @@
-"""FamilyVault AI — Chat Handler v15.3
+"""FamilyVault AI — Chat Handler v15.4
 
-Fixes vs v15.2:
-  BUG-A — Frontend link bleed: push {"type":"clear_links"} at the very start of
-           every orchestrate() call so the UI wipes its download-card state before
-           rendering the new turn. Previously, old links from prior turns kept
-           re-appearing because the frontend never received a clear signal.
+Fixes vs v15.3:
+  BUG-E — Duplicate download cards: all_links was extended without dedup.
+           When semantic_download matched the same file via multiple KB chunks,
+           the same card appeared twice. Fix: deduplicate by filename before
+           pushing the links event.
 
-  BUG-B — Decomposer still classifying "do you have X?", "tell me about X",
-           "have you know X" as download intents. Extended the CRITICAL guard
-           with additional trigger phrases and added explicit counter-examples.
+  BUG-F — Decomposer: "please share the resume of Rajat Roy" was being
+           classified as semantic_download because "share" was in the trigger
+           list but "please share <document description>" is an info request,
+           not a download request. Fixed the CRITICAL guard and added explicit
+           counter-examples for "please share the resume" → content_question
+           and "please share the PAN card" → content_question.
 
-  BUG-D — list_documents filter matched user names (Rajat, Roy) that appear in
-           many filenames, returning every document. Added personal-name tokens
-           to the stop-word list so they are excluded from keyword matching.
-
-Fixes from v15.2 (BUG 1-4, IAM) all retained unchanged.
+Fixes from v15.3 (BUG-A,B,D) and v15.2 (BUG 1-4) all retained unchanged.
 """
 import json, boto3, os, uuid, re, time
 from datetime import datetime, timezone
@@ -152,7 +151,6 @@ def load_long_term_memory(uid, current_sid, max_sessions=3):
                 a = (item.get("answer") or "").strip()
                 is_internal = a.startswith("[") and a.endswith("]")
                 if q and a and not is_internal:
-                    # BUG 4: strip markdown before injecting into LTM context
                     a_clean = re.sub(r'\*\*(.+?)\*\*', r'\1', a)
                     a_clean = re.sub(r'(?m)^[\-\*]\s+', '', a_clean).strip()
                     lines.append("Q: " + q)
@@ -427,13 +425,22 @@ RULES:
 
 CRITICAL — DOWNLOAD INTENT GUARD:
   NEVER emit exact_download or semantic_download unless the user's message
-  explicitly contains at least one of these trigger words/phrases (case-insensitive):
-    download, link, url, share, attach, get me the file, give me the file, send me the file
+  explicitly contains at least one of these trigger phrases (case-insensitive):
+    "download", "download link", "link", "url", "attach",
+    "get me the file", "give me the file", "send me the file",
+    "give me the download", "get the download"
 
-  The following phrases mean the user wants INFORMATION about a document, NOT a file:
-    "do you have", "have you", "know about", "tell me about", "what is", "what are",
-    "can you tell", "is there", "please share the details", "details about"
-  These must ALWAYS map to content_question or list_documents — NEVER to a download intent.
+  The following patterns ALWAYS map to content_question or list_documents,
+  NEVER to a download intent — even if the word "share" appears:
+    "please share the <document>", "please share <document>",
+    "can you share the <document>", "can you share <document>",
+    "share the details", "share the information",
+    "do you have", "have you", "know about", "tell me about",
+    "what is", "what are", "can you tell", "is there",
+    "please share the details", "details about"
+  The key rule: "please share X" where X is a DOCUMENT NAME or CONCEPT
+  is a request for INFORMATION about that document, NOT a file download.
+  Only "share the download link" or "share the file" trigger download intent.
 
 EXAMPLES:
 
@@ -461,6 +468,18 @@ User: "have you know Poushali doctor prescription reg Aishiki Roy?"
 
 User: "tell me about Rajat experience in Cloud Technology?"
 [{"intent_type":"content_question","target":"Rajat cloud experience","params":{"query":"Rajat Roy cloud technology experience"}}]
+
+User: "please share the resume of Rajat Roy"
+[{"intent_type":"content_question","target":"Rajat resume","params":{"query":"Rajat Roy resume work experience skills"}}]
+
+User: "please share the PAN card of Rajat"
+[{"intent_type":"content_question","target":"PAN card info","params":{"query":"Rajat Roy PAN card number"}}]
+
+User: "can you share Rajat AWS Professional details"
+[{"intent_type":"content_question","target":"Rajat AWS certifications","params":{"query":"Rajat Roy AWS professional certifications"}}]
+
+User: "give me the download link for my resume"
+[{"intent_type":"semantic_download","target":"resume","params":{"query":"resume"}}]
 
 User: "show me my Academic documents"
 [{"intent_type":"list_documents","target":"Academic documents","params":{"query":"Academic"}}]
@@ -569,7 +588,6 @@ def run_content_question(task, push, short_term, long_term, obs):
             if ch.get("type") == "content_block_delta":
                 tok = ch.get("delta",{}).get("text","")
                 if tok:
-                    # BUG 3: strip markdown from each streamed token
                     clean_tok = strip_markdown(tok)
                     full += clean_tok
                     push({"type":"token","content":clean_tok})
@@ -584,15 +602,12 @@ def run_content_question(task, push, short_term, long_term, obs):
     obs["input_tokens"] = obs.get("input_tokens",0) + inp
     obs["output_tokens"] = obs.get("output_tokens",0) + out
     obs["answerer_latency_ms"] = obs.get("answerer_latency_ms",0) + int((time.time()-t1)*1000)
-    # BUG 4: full already contains clean text — safe to write to DDB
     return full
 
 def run_list_documents(task, uid, push, obs):
     filter_q = task.get("params", {}).get("query", "").strip()
     all_docs = get_user_docs(uid)
     if filter_q:
-        # BUG-D FIX: expanded stop-list includes common personal names so that
-        # "semester exam of Rajat Roy" doesn't match every file containing "roy".
         stops = {
             "the","a","an","of","in","for","and","or","my","all","show","list",
             "any","some","about","please","share","documents","you","have",
@@ -600,7 +615,6 @@ def run_list_documents(task, uid, push, obs):
         }
         kws = [w for w in re.split(r'\W+', filter_q.lower()) if len(w) > 1 and w not in stops]
         if kws:
-            # BUG 1: include doc_category in search string
             all_docs = [d for d in all_docs if any(
                 kw in (
                     (d.get("filename","") or "").lower()
@@ -901,8 +915,6 @@ def orchestrate(query, uid, sid, push):
            "query_len":len(query),"answer_len":0,"short_term_turns":0,"long_term_sessions":0}
 
     # BUG-A FIX: tell the frontend to clear any link cards from the previous turn
-    # BEFORE we start sending new content. Without this signal the UI accumulates
-    # download cards across turns because it has no reset boundary.
     push({"type":"clear_links"})
 
     push({"type":"status","message":"Thinking..."})
@@ -971,7 +983,16 @@ def orchestrate(query, uid, sid, push):
             push({"type":"token","content":msg}); full_reply += msg
 
     if all_links:
-        push({"type":"links","links":all_links})
+        # BUG-E FIX: deduplicate by filename before pushing — prevents identical
+        # download cards when the same file is matched by multiple KB chunks.
+        seen_fnames = set()
+        unique_links = []
+        for lnk in all_links:
+            fn = lnk.get("filename","")
+            if fn not in seen_fnames:
+                seen_fnames.add(fn)
+                unique_links.append(lnk)
+        push({"type":"links","links":unique_links})
 
     obs["latency_ms"] = int((time.time()-t_start)*1000)
     obs["answer_len"] = len(full_reply)
