@@ -1,19 +1,28 @@
-"""FamilyVault AI — Chat Handler v15.4
+"""FamilyVault AI — Chat Handler v15.5
 
-Fixes vs v15.3:
-  BUG-E — Duplicate download cards: all_links was extended without dedup.
-           When semantic_download matched the same file via multiple KB chunks,
-           the same card appeared twice. Fix: deduplicate by filename before
-           pushing the links event.
+Fixes vs v15.4:
+  BUG-G — Token text "Here is the secure download link for X (valid 24h):"
+           was pushed as a streaming token before the link card. That token
+           persists in the AI bubble after clear_links clears the card,
+           causing ghost-text bleed into subsequent turns. Fix: removed the
+           token push from run_exact_download and run_semantic_download.
+           The link card is the only download UI needed.
 
-  BUG-F — Decomposer: "please share the resume of Rajat Roy" was being
-           classified as semantic_download because "share" was in the trigger
-           list but "please share <document description>" is an info request,
-           not a download request. Fixed the CRITICAL guard and added explicit
-           counter-examples for "please share the resume" → content_question
-           and "please share the PAN card" → content_question.
+  BUG-H — "Share the sem-1.pdf document link" classified as semantic_download
+           → KB vector search → Sem-2.pdf returned (higher cosine score than
+           Sem-1). Two-part fix:
+           (a) Decomposer prompt: exact filename (.pdf/.doc/.jpg extension)
+               MUST always → exact_download, not semantic_download.
+           (b) run_semantic_download: try exact_doc_match on the raw query
+               before calling KB — if the user said the filename exactly,
+               skip the vector search entirely.
 
-Fixes from v15.3 (BUG-A,B,D) and v15.2 (BUG 1-4) all retained unchanged.
+  BUG-I — content_question answerer said "I don't have the ability to
+           provide download links" — wrong, confusing. Clarified system
+           prompt: the AI CAN share download links but for content questions
+           it answers with document content, not file links.
+
+All v15.4 and earlier fixes retained unchanged.
 """
 import json, boto3, os, uuid, re, time
 from datetime import datetime, timezone
@@ -423,6 +432,15 @@ RULES:
 - delete_document → params.query = description of what to delete
 - Maximum 8 sub-tasks.
 
+EXACT FILENAME RULE (highest priority):
+  If the user's message contains a string that looks like a filename
+  (ends with .pdf, .doc, .docx, .jpg, .jpeg, .png, .txt, .xlsx, .pptx)
+  AND the message also contains a download trigger word — ALWAYS use
+  exact_download with params.filename = that exact filename string.
+  NEVER use semantic_download when an exact filename is given.
+  Example: "share the sem-1.pdf link" → exact_download with filename="Sem-1.pdf"
+  Example: "give me Rajat_Roy_Resume.pdf" → exact_download with filename="Rajat_Roy_Resume.pdf"
+
 CRITICAL — DOWNLOAD INTENT GUARD:
   NEVER emit exact_download or semantic_download unless the user's message
   explicitly contains at least one of these trigger phrases (case-insensitive):
@@ -440,13 +458,23 @@ CRITICAL — DOWNLOAD INTENT GUARD:
     "please share the details", "details about"
   The key rule: "please share X" where X is a DOCUMENT NAME or CONCEPT
   is a request for INFORMATION about that document, NOT a file download.
-  Only "share the download link" or "share the file" trigger download intent.
+  Only "share the download link", "share the link", or "share the file"
+  trigger download intent.
 
 EXAMPLES:
 
 User: "download Aishiki-aakash-first-payment-03042026.pdf and my PAN card"
 [{"intent_type":"exact_download","target":"Aishiki payment","params":{"filename":"Aishiki-aakash-first-payment-03042026.pdf"}},
  {"intent_type":"semantic_download","target":"PAN card","params":{"query":"PAN card"}}]
+
+User: "share the sem-1.pdf link"
+[{"intent_type":"exact_download","target":"Sem-1 marksheet","params":{"filename":"Sem-1.pdf"}}]
+
+User: "give me the sem-1.pdf document link"
+[{"intent_type":"exact_download","target":"Sem-1 marksheet","params":{"filename":"Sem-1.pdf"}}]
+
+User: "Ok. Share the sem-1.pdf document link"
+[{"intent_type":"exact_download","target":"Sem-1 marksheet","params":{"filename":"Sem-1.pdf"}}]
 
 User: "email my TCS offer letter to rajat@gmail.com professionally"
 [{"intent_type":"send_email","target":"TCS offer letter","params":{"recipients":["rajat@gmail.com"],"doc_refs":["TCS offer letter"],"tone":"Professional"}}]
@@ -462,6 +490,9 @@ User: "what does my offer letter say about my salary?"
 
 User: "do you have sem-1.pdf?"
 [{"intent_type":"content_question","target":"Sem-1 document","params":{"query":"Sem-1 first semester academic results"}}]
+
+User: "Do you have Rajat Semester-1 marksheet from First Year BTech exam?"
+[{"intent_type":"content_question","target":"Sem-1 BTech marksheet","params":{"query":"Rajat Roy semester 1 first year BTech marksheet grades"}}]
 
 User: "have you know Poushali doctor prescription reg Aishiki Roy?"
 [{"intent_type":"content_question","target":"Poushali prescription Aishiki","params":{"query":"Poushali doctor prescription Aishiki Roy"}}]
@@ -529,7 +560,9 @@ def run_exact_download(task, all_docs, push, obs):
         return None
     url = make_presigned(doc.get("s3_key",""), doc.get("filename","document"))
     if url:
-        push({"type":"token","content":"Here is the secure download link for " + doc.get("filename","") + " (valid 24h):"})
+        # BUG-G FIX: do NOT push a token here — the link card is the only UI needed.
+        # Pushing a token "Here is the secure download link..." caused that text to
+        # persist as ghost-text in the AI bubble across subsequent turns.
         return [{"filename": doc.get("filename","document"), "url": url}]
     push({"type":"token","content":"Found the file but could not generate a download link. Please try again."})
     return None
@@ -537,6 +570,24 @@ def run_exact_download(task, all_docs, push, obs):
 def run_semantic_download(task, all_docs, push, obs):
     query = task.get("params", {}).get("query", task.get("target",""))
     push({"type":"status","message":"Searching for: " + query[:50] + "..."})
+
+    # BUG-H FIX (part b): if the query looks like an exact filename, try direct
+    # match first — skip KB entirely to avoid wrong-file vector matches.
+    if re.search(r'\.(pdf|doc|docx|jpg|jpeg|png|txt|xlsx|pptx)$', query.strip(), re.I):
+        doc = exact_doc_match(all_docs, query.strip())
+        if not doc:
+            # try matching without extension precision (e.g. "Sem-1.pdf" → "sem-1.pdf")
+            for d in all_docs:
+                fn = (d.get("filename") or "").lower()
+                if fn == query.strip().lower() or fn.replace(" ","_") == query.strip().lower().replace(" ","_"):
+                    doc = d
+                    break
+        if doc:
+            url = make_presigned(doc.get("s3_key",""), doc.get("filename","document"))
+            if url:
+                # BUG-G FIX: no token push — link card is sufficient
+                return [{"filename": doc.get("filename","document"), "url": url}]
+
     t0 = time.time()
     chunks, sources = kb_search(query)
     obs["kb_latency_ms"] = obs.get("kb_latency_ms",0) + int((time.time()-t0)*1000)
@@ -549,7 +600,7 @@ def run_semantic_download(task, all_docs, push, obs):
         if doc:
             url = make_presigned(doc.get("s3_key",""), doc.get("filename","document"))
             if url:
-                push({"type":"token","content":"Here is the secure download link for " + doc.get("filename","") + " (valid 24h):"})
+                # BUG-G FIX: no token push — link card is sufficient
                 return [{"filename": doc.get("filename","document"), "url": url}]
     push({"type":"token","content":"Found references to '" + query + "' but couldn't generate a download link. Try using the exact filename."})
     return None
@@ -566,12 +617,21 @@ def run_content_question(task, push, short_term, long_term, obs):
         for ch in chunks[:6]
     )
     ltm_block = ("\n" + long_term + "\n\nUse above as BACKGROUND CONTEXT only.\n") if long_term else ""
-    system = ("You are FamilyVault AI \u2014 a warm, professional personal document assistant.\n"
+    # BUG-I FIX: clarified rule 4 — the AI CAN share download links but for
+    # content questions it answers with document content, not file links.
+    system = ("You are FamilyVault AI \u2014 a warm, professional personal document assistant. "
+              "You have the ability to answer questions about documents, share download links, "
+              "send emails, and list files.\n"
               + ltm_block + "\nRETRIEVED DOCUMENT CONTENT:\n" + rag_context
-              + "\n\nSTRICT RULES:\n1. Answer ONLY from retrieved content.\n"
-              "2. Be specific, quote exact values.\n3. Mention source document.\n"
-              "4. If not found: say warmly you couldn't find it.\n"
-              "5. No markdown bold or bullet stars.\n6. Keep concise and warm.")
+              + "\n\nSTRICT RULES:\n"
+              "1. Answer ONLY from retrieved content.\n"
+              "2. Be specific, quote exact values (names, numbers, dates).\n"
+              "3. Mention the source document name.\n"
+              "4. If not found in retrieved content: warmly say you couldn't find it "
+              "and suggest the user ask for a document list or download link.\n"
+              "5. Never say you cannot provide download links — you can, the user just "
+              "needs to ask for 'the download link' explicitly.\n"
+              "6. No markdown bold (**) or bullet stars. Keep concise and warm.")
     messages = list(short_term)
     messages.append({"role": "user", "content": query})
     full = ""
@@ -950,7 +1010,7 @@ def orchestrate(query, uid, sid, push):
                   for i, t in enumerate(tasks, 1)]
     push({"type":"scratchpad","event":"plan","content":"Tasks:\n" + "\n".join(plan_lines)})
 
-    needs_docs = any(t.get("intent_type") in ("exact_download","list_documents","send_email","delete_document") for t in tasks)
+    needs_docs = any(t.get("intent_type") in ("exact_download","list_documents","send_email","delete_document","semantic_download") for t in tasks)
     all_docs = get_user_docs(uid) if needs_docs else []
 
     full_reply, all_links, sources = "", [], []
@@ -983,8 +1043,7 @@ def orchestrate(query, uid, sid, push):
             push({"type":"token","content":msg}); full_reply += msg
 
     if all_links:
-        # BUG-E FIX: deduplicate by filename before pushing — prevents identical
-        # download cards when the same file is matched by multiple KB chunks.
+        # BUG-E FIX: deduplicate by filename before pushing
         seen_fnames = set()
         unique_links = []
         for lnk in all_links:
